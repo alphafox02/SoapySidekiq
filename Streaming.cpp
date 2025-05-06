@@ -10,7 +10,7 @@
 #include <SoapySDR/Formats.hpp>
 #include <sidekiq_types.h>
 
-SoapySidekiq *SoapySidekiq::thisClassAddr = nullptr;
+// SoapySidekiq *SoapySidekiq::thisClassAddr = nullptr;
 
 // Attempted to put this in SoapySidekiq.hpp and it would not link
 // could not understand why

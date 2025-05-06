@@ -8,6 +8,27 @@
 #include <sidekiq_types.h>
 #include <unistd.h>
 
+// instantiate the static pointer exactly once:
+SoapySidekiq* SoapySidekiq::thisClassAddr = nullptr;
+
+// out‑of‑line definition of the callbacks:
+void SoapySidekiq::static_tx_complete_callback(int32_t status,
+                                               skiq_tx_block_t *p_data,
+                                               void *p_user)
+{
+    auto *instance = static_cast<passedStruct*>(p_user);
+    SoapySidekiq *self = instance->classAddr;
+    uint32_t txIndex = instance->txIndex;
+    self->tx_complete(status, p_data, txIndex);
+    delete instance;
+}
+
+void SoapySidekiq::static_tx_enabled_callback(uint8_t card, int32_t status)
+{
+    SoapySidekiq *self = thisClassAddr;
+    self->tx_enabled(card, status);
+}
+
 /******************************************************************************/
 /** This is the custom logging handler.  If there were custom handling
     required for logging messages, it should be handled here.
@@ -111,7 +132,6 @@ void SoapySidekiq::tx_enabled(uint8_t card, int32_t status)
 std::vector<SoapySDR::Kwargs> SoapySidekiq::sidekiq_devices;
 bool                          SoapySidekiq::rx_running;
 
-
 // compares two strings and if equal range and equal values per character
 // returns true.
 bool equalsIgnoreCase(const std::string& a, const std::string& b)
@@ -133,7 +153,8 @@ SoapySidekiq::SoapySidekiq(const SoapySDR::Kwargs &args)
 
     /* Register our own logging function before initializing the library */
     skiq_register_logging( logging_handler );
-   
+    
+
     SoapySDR_logf(SOAPY_SDR_TRACE, "in constructor", card);
 
     /* We need to set some default parameters in case the user does not */
@@ -2073,16 +2094,15 @@ double SoapySidekiq::getReferenceClockRate(void) const
 }
 
 // ------------------------------------------------------------------
-// Expose the ADRV9002’s discrete sample‑rate table to SoapySDR apps
+// expose the discrete sample‐rate table
 std::vector<double> SoapySidekiq::listSampleRates(
     const int direction, const size_t channel) const
 {
-    static const std::vector<double> rates = {
+    return {
         541667, 1920000, 2457600, 2800000, 3840000, 4000000,
         4915200, 5600000, 7680000, 9830400,10000000,11200000,
         15360000,16000000,20000000,21666700,22000000,
         23040000,30720000,40000000,61440000
     };
-    return rates;
 }
 

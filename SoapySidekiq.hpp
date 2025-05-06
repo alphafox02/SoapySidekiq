@@ -117,35 +117,35 @@ class SoapySidekiq : public SoapySDR::Device
         /*******************************************************************
          * Frequency API
          ******************************************************************/
-        void setFrequency(const int direction,
-                          const size_t channel,
-                          const double frequency,
-                          const SoapySDR::Kwargs &args = SoapySDR::Kwargs());
+        void setFrequency(const int direction, const size_t channel,
+                const double frequency,
+                const SoapySDR::Kwargs &args = SoapySDR::Kwargs());
         double getFrequency(const int direction,
-                            const size_t channel) const;
+                const size_t channel) const;
         SoapySDR::RangeList getFrequencyRange(const int direction,
-                                              const size_t channel) const;
+                const size_t channel) const;
 
         /*******************************************************************
          * Sample Rate API
          ******************************************************************/
         void setSampleRate(const int direction,
-                           const size_t channel,
-                           const double rate);
+                const size_t channel,
+                const double rate);
         double getSampleRate(const int direction,
-                             const size_t channel) const;
+                const size_t channel) const;
         SoapySDR::RangeList getSampleRateRange(const int    direction,
-                                               const size_t channel) const;
+                const size_t channel) const;
 
-        // ← added: expose discrete ADRV9002 rates for listSampleRates()
-        virtual std::vector<double> listSampleRates(
-            const int direction, const size_t channel) const override;
+        /** expose a fixed discrete table of supported sample‑rates */
+        std::vector<double> listSampleRates(const int direction,
+                const size_t channel) const override;
+
 
         void setBandwidth(const int direction,
-                          const size_t channel,
-                          const double bw);
+                const size_t channel,
+                const double bw);
         double getBandwidth(const int direction,
-                            const size_t channel) const;
+                const size_t channel) const;
 
         /*******************************************************************
          * Sensor API
@@ -158,7 +158,7 @@ class SoapySidekiq : public SoapySDR::Device
          ******************************************************************/
         SoapySDR::ArgInfoList getSettingInfo(void) const;
         void writeSetting(const std::string &key,
-                          const std::string &value);
+                const std::string &value);
         std::string readSetting(const std::string &key) const;
 
         /*******************************************************************
@@ -170,7 +170,7 @@ class SoapySidekiq : public SoapySDR::Device
         bool hasHardwareTime(const std::string &) const;
         long long getHardwareTime(const std::string &) const;
         void setHardwareTime(const long long timeNs,
-                             const std::string &what);
+                const std::string &what);
 
         /*******************************************************************
          * Clocking API
@@ -180,21 +180,20 @@ class SoapySidekiq : public SoapySDR::Device
         std::string getClockSource(void) const;
         double getReferenceClockRate(void) const;
 
-
     private:
-        long long convert_timestamp_to_nanos(const uint64_t timestamp, 
+        long long convert_timestamp_to_nanos(const uint64_t timestamp,  
                                              const uint64_t timestamp_freq) const;
 
         SoapySDR::Stream *const TX_STREAM = (SoapySDR::Stream *)0x1;
         SoapySDR::Stream *const RX_STREAM = (SoapySDR::Stream *)0x2;
 
-        //  sidekiq card state & parameters…
+        //  sidekiq card
         std::string part_str;
         skiq_part_t part;
         skiq_param_t param;
         uint8_t card{};
-        std::string serial;
-        std::string timeSource;
+        std::basic_string<char> serial{};
+        std::basic_string<char> timeSource{};
         uint32_t resolution{};
         double maxValue{};
 
@@ -202,12 +201,13 @@ class SoapySidekiq : public SoapySDR::Device
         bool txUseShort{};
         uint32_t debug_ctr{};
 
-        // RX fields
+        //  rx
         std::mutex rx_mutex;
         std::condition_variable _cv;
-        std::string timetype;
+        std::basic_string<char> timetype{};
         static bool rx_running;
         bool rx_receive_operation_exited_due_to_error{};
+
         uint8_t num_rx_channels{};
         skiq_rx_hdl_t rx_hdl{};
         uint64_t rx_center_frequency{};
@@ -218,7 +218,7 @@ class SoapySidekiq : public SoapySDR::Device
         uint32_t rx_payload_size_in_bytes{};
         uint32_t rx_payload_size_in_words{};
 
-        // TX fields
+        //  tx
         std::mutex tx_mutex;
         std::mutex tx_buf_mutex;
         pthread_mutex_t tx_enabled_mutex;
@@ -228,7 +228,8 @@ class SoapySidekiq : public SoapySDR::Device
         bool space_avail{};
         int32_t *p_tx_status{};
         bool first_transmit{};
-        uint8_t num_tx_channels{};
+
+        uint8_t  num_tx_channels{};
         skiq_tx_hdl_t tx_hdl{};
         uint64_t tx_center_frequency{};
         uint32_t tx_sample_rate{};
@@ -237,40 +238,52 @@ class SoapySidekiq : public SoapySDR::Device
         uint32_t complete_count{};
         uint32_t current_tx_block_size{};
 
-        // Settings
+        //  setting
         bool iq_swap{};
         bool counter{};
         bool log{};
         bool rfTimeSource{};
         uint64_t sys_freq{};
 
-        // Buffers
+        // RX buffer
         skiq_rx_block_t *p_rx_block[DEFAULT_NUM_BUFFERS];
         uint32_t rxReadIndex{};
         uint32_t rxWriteIndex{};
+
+        // TX buffer
         skiq_tx_block_t *p_tx_block[DEFAULT_NUM_BUFFERS];
         uint32_t currTXBuffIndex{};
         uint32_t p_tx_block_index{};
 
-        // Callbacks
-        static void static_tx_complete_callback(int32_t status, 
-                                                skiq_tx_block_t *p_data, 
+        // TX callback static function
+        static void static_tx_complete_callback(int32_t status,  
+                                                skiq_tx_block_t *p_data,  
                                                 void *p_user);
         static void static_tx_enabled_callback(uint8_t card, int32_t status);
         static SoapySidekiq *thisClassAddr;
 
     public:
-        struct passedStruct {
+        struct passedStruct
+        {
             SoapySidekiq *classAddr;
             uint32_t txIndex;
         };
+
         passedStruct *passedStructInstance;
+
+        //  receive thread
         std::thread _rx_receive_thread;
         void rx_receive_operation(void);
         void rx_receive_operation_impl(void);
-        std::vector<SoapySDR::Kwargs> sidekiq_devices;
+        static std::vector<SoapySDR::Kwargs> sidekiq_devices;  // ← made static
+
+        // tx thread
         std::thread _tx_streaming_thread;
         void tx_streaming_start();
+
+        // tx callback method
         void tx_complete(int32_t status, skiq_tx_block_t *p_data, uint32_t txIndex);
+
+        // tx enabled callback
         void tx_enabled(uint8_t card, int32_t status);
 };
