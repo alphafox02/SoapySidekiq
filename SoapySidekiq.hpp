@@ -137,7 +137,7 @@ class SoapySidekiq : public SoapySDR::Device
         SoapySDR::RangeList getSampleRateRange(const int    direction,
                                                const size_t channel) const;
 
-        //!< Expose the discrete ADRV9002 rates for listSampleRates()
+        // ← added: expose discrete ADRV9002 rates for listSampleRates()
         virtual std::vector<double> listSampleRates(
             const int direction, const size_t channel) const override;
 
