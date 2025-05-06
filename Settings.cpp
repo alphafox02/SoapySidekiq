@@ -2072,3 +2072,17 @@ double SoapySidekiq::getReferenceClockRate(void) const
     return 0;
 }
 
+// ------------------------------------------------------------------
+// Expose the ADRV9002’s discrete sample‑rate table to SoapySDR apps
+std::vector<double> SoapySidekiq::listSampleRates(
+    const int direction, const size_t channel) const
+{
+    static const std::vector<double> rates = {
+        541667, 1920000, 2457600, 2800000, 3840000, 4000000,
+        4915200, 5600000, 7680000, 9830400,10000000,11200000,
+        15360000,16000000,20000000,21666700,22000000,
+        23040000,30720000,40000000,61440000
+    };
+    return rates;
+}
+
