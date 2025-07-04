@@ -331,7 +331,78 @@ SoapySDR::Stream *SoapySidekiq::setupStream(const int direction,
         return RX_STREAM;
     }
     else if (direction == SOAPY_SDR_TX)
-    {
+    {int SoapySidekiq::readStream(
+    SoapySDR::Stream *stream,
+    void *const *buffs,
+    const size_t numElems,
+    int &flags,
+    long long &timeNs,
+    const long timeoutUs)
+{
+    if (stream != RX_STREAM)
+        return SOAPY_SDR_NOT_SUPPORTED;
+    else if (rx_receive_operation_exited_due_to_error)
+        return SOAPY_SDR_STREAM_ERROR;
+
+    // Provide as many as possible from leftovers first
+    size_t samples_provided = 0;
+    int16_t *user_buff = static_cast<int16_t *>(buffs[0]);
+
+    // Handle leftovers in rx_fifo_buffer from previous read
+    while (samples_provided < numElems && rx_fifo_offset < rx_fifo_buffer.size()) {
+        user_buff[samples_provided++] = rx_fifo_buffer[rx_fifo_offset++];
+    }
+
+    // If leftovers exhausted, clear FIFO
+    if (rx_fifo_offset >= rx_fifo_buffer.size()) {
+        rx_fifo_buffer.clear();
+        rx_fifo_offset = 0;
+    }
+
+    // Now pull from hardware ring buffer
+    while (samples_provided < numElems) {
+        // Wait for buffer to be available
+        long waitTime = timeoutUs ? timeoutUs : SLEEP_1SEC;
+        while ((rxReadIndex == rxWriteIndex) && (waitTime > 0)) {
+            usleep(DEFAULT_SLEEP_US);
+            waitTime -= DEFAULT_SLEEP_US;
+        }
+        if (waitTime <= 0) break; // timeout
+
+        skiq_rx_block_t *block_ptr = p_rx_block[rxReadIndex];
+        int16_t *src_ptr = reinterpret_cast<int16_t *>(block_ptr->data);
+        size_t block_samples = rx_payload_size_in_words * 2; // I and Q
+
+        size_t samples_to_copy = std::min(numElems - samples_provided, block_samples);
+
+        // Copy what we can
+        memcpy(user_buff + samples_provided, src_ptr, samples_to_copy * sizeof(int16_t));
+        samples_provided += samples_to_copy;
+
+        // Save leftovers for next call if user buffer is smaller than block
+        if (samples_to_copy < block_samples) {
+            rx_fifo_buffer.resize(block_samples - samples_to_copy);
+            memcpy(rx_fifo_buffer.data(), src_ptr + samples_to_copy,
+                   (block_samples - samples_to_copy) * sizeof(int16_t));
+            rx_fifo_offset = 0;
+        }
+
+        // Advance ring index if fully consumed
+        if (samples_to_copy == block_samples)
+            rxReadIndex = (rxReadIndex + 1) % DEFAULT_NUM_BUFFERS;
+        else
+            break; // will finish leftovers next call
+    }
+
+    // Set timestamp and flags
+    if (samples_provided > 0) {
+        flags = SOAPY_SDR_HAS_TIME;
+        timeNs = 0; // You could set actual timestamp from block_ptr if you want
+        return samples_provided / 2; // Return number of I/Q pairs (not shorts)
+    } else {
+        return SOAPY_SDR_TIMEOUT;
+    }
+}
         //  check the channel configuration
         if (channels.size() > 1)
         {
@@ -747,86 +818,69 @@ int SoapySidekiq::readStream(
     long long &timeNs,
     const long timeoutUs)
 {
-    if (stream != RX_STREAM) return SOAPY_SDR_NOT_SUPPORTED;
-    if (rx_receive_operation_exited_due_to_error) return SOAPY_SDR_STREAM_ERROR;
+    if (stream != RX_STREAM)
+        return SOAPY_SDR_NOT_SUPPORTED;
+    else if (rx_receive_operation_exited_due_to_error)
+        return SOAPY_SDR_STREAM_ERROR;
 
-    long waitTime = timeoutUs;
-    if (waitTime == 0) waitTime = SLEEP_1SEC;
+    // Provide as many as possible from leftovers first
+    size_t samples_provided = 0;
+    int16_t *user_buff = static_cast<int16_t *>(buffs[0]);
 
-    int16_t *out_ptr = (int16_t *)buffs[0];
-    size_t samples_done = 0; // number of *complex* samples
-    bool timestamp_set = false;
+    // Handle leftovers in rx_fifo_buffer from previous read
+    while (samples_provided < numElems && rx_fifo_offset < rx_fifo_buffer.size()) {
+        user_buff[samples_provided++] = rx_fifo_buffer[rx_fifo_offset++];
+    }
 
-    while (samples_done < numElems)
-    {
-        // 1. FIFO buffer for leftovers (in complex samples)
-        size_t fifo_complex = rx_fifo_buffer.size() / 2 - rx_fifo_offset;
-        if (fifo_complex > 0)
-        {
-            size_t to_copy = std::min(fifo_complex, numElems - samples_done);
-            memcpy(
-                out_ptr,
-                rx_fifo_buffer.data() + rx_fifo_offset * 2,
-                to_copy * 2 * sizeof(int16_t));
-            rx_fifo_offset += to_copy;
-            out_ptr += to_copy * 2;
-            samples_done += to_copy;
+    // If leftovers exhausted, clear FIFO
+    if (rx_fifo_offset >= rx_fifo_buffer.size()) {
+        rx_fifo_buffer.clear();
+        rx_fifo_offset = 0;
+    }
 
-            if (rx_fifo_offset * 2 >= rx_fifo_buffer.size())
-            {
-                rx_fifo_buffer.clear();
-                rx_fifo_offset = 0;
-            }
-            continue;
-        }
-
-        // 2. Wait for new block from ring buffer
-        while ((rxReadIndex == rxWriteIndex) && (waitTime > 0))
-        {
+    // Now pull from hardware ring buffer
+    while (samples_provided < numElems) {
+        // Wait for buffer to be available
+        long waitTime = timeoutUs ? timeoutUs : SLEEP_1SEC;
+        while ((rxReadIndex == rxWriteIndex) && (waitTime > 0)) {
             usleep(DEFAULT_SLEEP_US);
             waitTime -= DEFAULT_SLEEP_US;
         }
-        if (waitTime <= 0)
-        {
-            return samples_done > 0 ? samples_done : SOAPY_SDR_TIMEOUT;
-        }
+        if (waitTime <= 0) break; // timeout
 
         skiq_rx_block_t *block_ptr = p_rx_block[rxReadIndex];
-        int16_t *block_data = (int16_t *)block_ptr->data;
-        size_t block_complex = rx_payload_size_in_words; // hardware gives complex samples
+        int16_t *src_ptr = reinterpret_cast<int16_t *>(block_ptr->data);
+        size_t block_samples = rx_payload_size_in_words * 2; // I and Q
 
-        if (!timestamp_set)
-        {
-            if (this->rfTimeSource)
-                timeNs = convert_timestamp_to_nanos(block_ptr->rf_timestamp, rx_sample_rate);
-            else
-                timeNs = convert_timestamp_to_nanos(block_ptr->sys_timestamp, sys_freq);
-            flags = SOAPY_SDR_HAS_TIME;
-            timestamp_set = true;
-        }
+        size_t samples_to_copy = std::min(numElems - samples_provided, block_samples);
 
-        size_t needed = numElems - samples_done;
+        // Copy what we can
+        memcpy(user_buff + samples_provided, src_ptr, samples_to_copy * sizeof(int16_t));
+        samples_provided += samples_to_copy;
 
-        if (needed >= block_complex)
-        {
-            memcpy(out_ptr, block_data, block_complex * 2 * sizeof(int16_t));
-            out_ptr += block_complex * 2;
-            samples_done += block_complex;
-            rxReadIndex = (rxReadIndex + 1) % DEFAULT_NUM_BUFFERS;
-        }
-        else
-        {
-            memcpy(out_ptr, block_data, needed * 2 * sizeof(int16_t));
-            out_ptr += needed * 2;
-            samples_done += needed;
-            // Store remaining complex samples (not int16_t!) in FIFO buffer
-            rx_fifo_buffer.resize((block_complex - needed) * 2);
-            memcpy(rx_fifo_buffer.data(), block_data + needed * 2, (block_complex - needed) * 2 * sizeof(int16_t));
+        // Save leftovers for next call if user buffer is smaller than block
+        if (samples_to_copy < block_samples) {
+            rx_fifo_buffer.resize(block_samples - samples_to_copy);
+            memcpy(rx_fifo_buffer.data(), src_ptr + samples_to_copy,
+                   (block_samples - samples_to_copy) * sizeof(int16_t));
             rx_fifo_offset = 0;
-            rxReadIndex = (rxReadIndex + 1) % DEFAULT_NUM_BUFFERS;
         }
+
+        // Advance ring index if fully consumed
+        if (samples_to_copy == block_samples)
+            rxReadIndex = (rxReadIndex + 1) % DEFAULT_NUM_BUFFERS;
+        else
+            break; // will finish leftovers next call
     }
-    return samples_done; // Return number of *complex* samples
+
+    // Set timestamp and flags
+    if (samples_provided > 0) {
+        flags = SOAPY_SDR_HAS_TIME;
+        timeNs = 0; // You could set actual timestamp from block_ptr if you want
+        return samples_provided / 2; // Return number of I/Q pairs (not shorts)
+    } else {
+        return SOAPY_SDR_TIMEOUT;
+    }
 }
 
 int SoapySidekiq::writeStream(SoapySDR::Stream * stream,
