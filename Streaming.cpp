@@ -181,7 +181,118 @@ int SoapySidekiq::readStream(
                     float_ptr[i * 2 + 1] = float(block_data[i * 2 + 1]) / float(this->maxValue);
                 }
             }
-            out_ptr += needed * 2;
+            out_ptr += needed * 2;int SoapySidekiq::readStream(
+    SoapySDR::Stream *stream,
+    void *const *buffs,
+    const size_t numElems,
+    int &flags,
+    long long &timeNs,
+    const long timeoutUs)
+{
+    if (stream != RX_STREAM) return SOAPY_SDR_NOT_SUPPORTED;
+    if (rx_receive_operation_exited_due_to_error) return SOAPY_SDR_STREAM_ERROR;
+
+    size_t samples_done = 0;
+    bool timestamp_set = false;
+    long waitTime = (timeoutUs == 0) ? SLEEP_1SEC : timeoutUs;
+
+    // Output pointer
+    void *output_buf = buffs[0];
+
+    while (samples_done < numElems) {
+        // Consume any FIFO buffer leftovers first
+        size_t fifo_left = (rx_fifo_buffer.size() / 2) - rx_fifo_offset;
+        if (fifo_left > 0) {
+            size_t to_copy = std::min(fifo_left, numElems - samples_done);
+
+            if (rxUseShort) {
+                int16_t *out_ptr = reinterpret_cast<int16_t *>(output_buf);
+                std::memcpy(
+                    out_ptr + samples_done * 2,
+                    rx_fifo_buffer.data() + rx_fifo_offset * 2,
+                    to_copy * 2 * sizeof(int16_t));
+            } else {
+                float *out_ptr = reinterpret_cast<float *>(output_buf);
+                for (size_t i = 0; i < to_copy; ++i) {
+                    out_ptr[(samples_done + i) * 2]     = float(rx_fifo_buffer[(rx_fifo_offset + i) * 2])     / float(this->maxValue);
+                    out_ptr[(samples_done + i) * 2 + 1] = float(rx_fifo_buffer[(rx_fifo_offset + i) * 2 + 1]) / float(this->maxValue);
+                }
+            }
+            rx_fifo_offset += to_copy;
+            samples_done += to_copy;
+
+            if (rx_fifo_offset * 2 >= rx_fifo_buffer.size()) {
+                rx_fifo_buffer.clear();
+                rx_fifo_offset = 0;
+            }
+            continue;
+        }
+
+        // Wait for a new block in the ring buffer
+        while ((rxReadIndex == rxWriteIndex) && (waitTime > 0)) {
+            usleep(DEFAULT_SLEEP_US);
+            waitTime -= DEFAULT_SLEEP_US;
+        }
+        if (waitTime <= 0) {
+            return (samples_done > 0) ? samples_done : SOAPY_SDR_TIMEOUT;
+        }
+
+        skiq_rx_block_t *block_ptr = p_rx_block[rxReadIndex];
+        const volatile int16_t *block_data = block_ptr->data; // FIXED: don't cast away volatile
+        size_t block_complex = rx_payload_size_in_words;
+
+        // Set timestamp on first sample delivered
+        if (!timestamp_set) {
+            if (this->rfTimeSource)
+                timeNs = convert_timestamp_to_nanos(block_ptr->rf_timestamp, rx_sample_rate);
+            else
+                timeNs = convert_timestamp_to_nanos(block_ptr->sys_timestamp, sys_freq);
+            flags = SOAPY_SDR_HAS_TIME;
+            timestamp_set = true;
+        }
+
+        size_t needed = numElems - samples_done;
+
+        if (needed >= block_complex) {
+            if (rxUseShort) {
+                int16_t *out_ptr = reinterpret_cast<int16_t *>(output_buf);
+                for (size_t i = 0; i < block_complex * 2; ++i)
+                    out_ptr[samples_done * 2 + i] = block_data[i];
+            } else {
+                float *out_ptr = reinterpret_cast<float *>(output_buf);
+                for (size_t i = 0; i < block_complex; ++i) {
+                    out_ptr[(samples_done + i) * 2]     = float(block_data[i * 2])     / float(this->maxValue);
+                    out_ptr[(samples_done + i) * 2 + 1] = float(block_data[i * 2 + 1]) / float(this->maxValue);
+                }
+            }
+            samples_done += block_complex;
+            rxReadIndex = (rxReadIndex + 1) % DEFAULT_NUM_BUFFERS;
+        } else {
+            // Copy part of block, save leftovers
+            if (rxUseShort) {
+                int16_t *out_ptr = reinterpret_cast<int16_t *>(output_buf);
+                for (size_t i = 0; i < needed * 2; ++i)
+                    out_ptr[samples_done * 2 + i] = block_data[i];
+            } else {
+                float *out_ptr = reinterpret_cast<float *>(output_buf);
+                for (size_t i = 0; i < needed; ++i) {
+                    out_ptr[(samples_done + i) * 2]     = float(block_data[i * 2])     / float(this->maxValue);
+                    out_ptr[(samples_done + i) * 2 + 1] = float(block_data[i * 2 + 1]) / float(this->maxValue);
+                }
+            }
+            // Save leftovers for next call
+            size_t leftovers = block_complex - needed;
+            rx_fifo_buffer.resize(leftovers * 2);
+            for (size_t i = 0; i < leftovers * 2; ++i)
+                rx_fifo_buffer[i] = block_data[needed * 2 + i];
+            rx_fifo_offset = 0;
+            samples_done += needed;
+            rxReadIndex = (rxReadIndex + 1) % DEFAULT_NUM_BUFFERS;
+        }
+    }
+    return samples_done;
+}
+
             samples_done += needed;
 
             // Store leftover samples
@@ -478,7 +589,118 @@ SoapySDR::Stream *SoapySidekiq::setupStream(const int direction,
         size_t samples_to_copy = std::min(numElems - samples_provided, block_samples);
 
         // Copy what we can
-        memcpy(user_buff + samples_provided, src_ptr, samples_to_copy * sizeof(int16_t));
+        memcpy(user_buint SoapySidekiq::readStream(
+    SoapySDR::Stream *stream,
+    void *const *buffs,
+    const size_t numElems,
+    int &flags,
+    long long &timeNs,
+    const long timeoutUs)
+{
+    if (stream != RX_STREAM) return SOAPY_SDR_NOT_SUPPORTED;
+    if (rx_receive_operation_exited_due_to_error) return SOAPY_SDR_STREAM_ERROR;
+
+    size_t samples_done = 0;
+    bool timestamp_set = false;
+    long waitTime = (timeoutUs == 0) ? SLEEP_1SEC : timeoutUs;
+
+    // Output pointer
+    void *output_buf = buffs[0];
+
+    while (samples_done < numElems) {
+        // Consume any FIFO buffer leftovers first
+        size_t fifo_left = (rx_fifo_buffer.size() / 2) - rx_fifo_offset;
+        if (fifo_left > 0) {
+            size_t to_copy = std::min(fifo_left, numElems - samples_done);
+
+            if (rxUseShort) {
+                int16_t *out_ptr = reinterpret_cast<int16_t *>(output_buf);
+                std::memcpy(
+                    out_ptr + samples_done * 2,
+                    rx_fifo_buffer.data() + rx_fifo_offset * 2,
+                    to_copy * 2 * sizeof(int16_t));
+            } else {
+                float *out_ptr = reinterpret_cast<float *>(output_buf);
+                for (size_t i = 0; i < to_copy; ++i) {
+                    out_ptr[(samples_done + i) * 2]     = float(rx_fifo_buffer[(rx_fifo_offset + i) * 2])     / float(this->maxValue);
+                    out_ptr[(samples_done + i) * 2 + 1] = float(rx_fifo_buffer[(rx_fifo_offset + i) * 2 + 1]) / float(this->maxValue);
+                }
+            }
+            rx_fifo_offset += to_copy;
+            samples_done += to_copy;
+
+            if (rx_fifo_offset * 2 >= rx_fifo_buffer.size()) {
+                rx_fifo_buffer.clear();
+                rx_fifo_offset = 0;
+            }
+            continue;
+        }
+
+        // Wait for a new block in the ring buffer
+        while ((rxReadIndex == rxWriteIndex) && (waitTime > 0)) {
+            usleep(DEFAULT_SLEEP_US);
+            waitTime -= DEFAULT_SLEEP_US;
+        }
+        if (waitTime <= 0) {
+            return (samples_done > 0) ? samples_done : SOAPY_SDR_TIMEOUT;
+        }
+
+        skiq_rx_block_t *block_ptr = p_rx_block[rxReadIndex];
+        const volatile int16_t *block_data = block_ptr->data; // FIXED: don't cast away volatile
+        size_t block_complex = rx_payload_size_in_words;
+
+        // Set timestamp on first sample delivered
+        if (!timestamp_set) {
+            if (this->rfTimeSource)
+                timeNs = convert_timestamp_to_nanos(block_ptr->rf_timestamp, rx_sample_rate);
+            else
+                timeNs = convert_timestamp_to_nanos(block_ptr->sys_timestamp, sys_freq);
+            flags = SOAPY_SDR_HAS_TIME;
+            timestamp_set = true;
+        }
+
+        size_t needed = numElems - samples_done;
+
+        if (needed >= block_complex) {
+            if (rxUseShort) {
+                int16_t *out_ptr = reinterpret_cast<int16_t *>(output_buf);
+                for (size_t i = 0; i < block_complex * 2; ++i)
+                    out_ptr[samples_done * 2 + i] = block_data[i];
+            } else {
+                float *out_ptr = reinterpret_cast<float *>(output_buf);
+                for (size_t i = 0; i < block_complex; ++i) {
+                    out_ptr[(samples_done + i) * 2]     = float(block_data[i * 2])     / float(this->maxValue);
+                    out_ptr[(samples_done + i) * 2 + 1] = float(block_data[i * 2 + 1]) / float(this->maxValue);
+                }
+            }
+            samples_done += block_complex;
+            rxReadIndex = (rxReadIndex + 1) % DEFAULT_NUM_BUFFERS;
+        } else {
+            // Copy part of block, save leftovers
+            if (rxUseShort) {
+                int16_t *out_ptr = reinterpret_cast<int16_t *>(output_buf);
+                for (size_t i = 0; i < needed * 2; ++i)
+                    out_ptr[samples_done * 2 + i] = block_data[i];
+            } else {
+                float *out_ptr = reinterpret_cast<float *>(output_buf);
+                for (size_t i = 0; i < needed; ++i) {
+                    out_ptr[(samples_done + i) * 2]     = float(block_data[i * 2])     / float(this->maxValue);
+                    out_ptr[(samples_done + i) * 2 + 1] = float(block_data[i * 2 + 1]) / float(this->maxValue);
+                }
+            }
+            // Save leftovers for next call
+            size_t leftovers = block_complex - needed;
+            rx_fifo_buffer.resize(leftovers * 2);
+            for (size_t i = 0; i < leftovers * 2; ++i)
+                rx_fifo_buffer[i] = block_data[needed * 2 + i];
+            rx_fifo_offset = 0;
+            samples_done += needed;
+            rxReadIndex = (rxReadIndex + 1) % DEFAULT_NUM_BUFFERS;
+        }
+    }
+    return samples_done;
+}
+ff + samples_provided, src_ptr, samples_to_copy * sizeof(int16_t));
         samples_provided += samples_to_copy;
 
         // Save leftovers for next call if user buffer is smaller than block
@@ -923,27 +1145,35 @@ int SoapySidekiq::readStream(
     if (stream != RX_STREAM) return SOAPY_SDR_NOT_SUPPORTED;
     if (rx_receive_operation_exited_due_to_error) return SOAPY_SDR_STREAM_ERROR;
 
-    // Setup for reading
     size_t samples_done = 0;
-    int16_t *out_ptr = reinterpret_cast<int16_t *>(buffs[0]);
     bool timestamp_set = false;
     long waitTime = (timeoutUs == 0) ? SLEEP_1SEC : timeoutUs;
 
-    // Any leftovers from previous partial block?
+    // Output pointer
+    void *output_buf = buffs[0];
+
     while (samples_done < numElems) {
-        // If there are leftovers in rx_fifo_buffer, consume those first
+        // Consume any FIFO buffer leftovers first
         size_t fifo_left = (rx_fifo_buffer.size() / 2) - rx_fifo_offset;
         if (fifo_left > 0) {
             size_t to_copy = std::min(fifo_left, numElems - samples_done);
-            std::memcpy(
-                out_ptr,
-                rx_fifo_buffer.data() + rx_fifo_offset * 2,
-                to_copy * 2 * sizeof(int16_t));
+
+            if (rxUseShort) {
+                int16_t *out_ptr = reinterpret_cast<int16_t *>(output_buf);
+                std::memcpy(
+                    out_ptr + samples_done * 2,
+                    rx_fifo_buffer.data() + rx_fifo_offset * 2,
+                    to_copy * 2 * sizeof(int16_t));
+            } else {
+                float *out_ptr = reinterpret_cast<float *>(output_buf);
+                for (size_t i = 0; i < to_copy; ++i) {
+                    out_ptr[(samples_done + i) * 2]     = float(rx_fifo_buffer[(rx_fifo_offset + i) * 2])     / float(this->maxValue);
+                    out_ptr[(samples_done + i) * 2 + 1] = float(rx_fifo_buffer[(rx_fifo_offset + i) * 2 + 1]) / float(this->maxValue);
+                }
+            }
             rx_fifo_offset += to_copy;
-            out_ptr += to_copy * 2;
             samples_done += to_copy;
 
-            // Clear buffer if fully consumed
             if (rx_fifo_offset * 2 >= rx_fifo_buffer.size()) {
                 rx_fifo_buffer.clear();
                 rx_fifo_offset = 0;
@@ -957,13 +1187,12 @@ int SoapySidekiq::readStream(
             waitTime -= DEFAULT_SLEEP_US;
         }
         if (waitTime <= 0) {
-            // Timeout
             return (samples_done > 0) ? samples_done : SOAPY_SDR_TIMEOUT;
         }
 
         skiq_rx_block_t *block_ptr = p_rx_block[rxReadIndex];
-        int16_t *block_data = reinterpret_cast<int16_t *>(block_ptr->data);
-        size_t block_complex = rx_payload_size_in_words; // Complex samples in this block
+        const volatile int16_t *block_data = block_ptr->data; // FIXED: don't cast away volatile
+        size_t block_complex = rx_payload_size_in_words;
 
         // Set timestamp on first sample delivered
         if (!timestamp_set) {
@@ -976,43 +1205,44 @@ int SoapySidekiq::readStream(
         }
 
         size_t needed = numElems - samples_done;
+
         if (needed >= block_complex) {
-            // Copy the whole block
             if (rxUseShort) {
-                std::memcpy(out_ptr, block_data, block_complex * 2 * sizeof(int16_t));
+                int16_t *out_ptr = reinterpret_cast<int16_t *>(output_buf);
+                for (size_t i = 0; i < block_complex * 2; ++i)
+                    out_ptr[samples_done * 2 + i] = block_data[i];
             } else {
-                float *float_ptr = reinterpret_cast<float *>(out_ptr);
+                float *out_ptr = reinterpret_cast<float *>(output_buf);
                 for (size_t i = 0; i < block_complex; ++i) {
-                    float_ptr[i * 2]     = float(block_data[i * 2])     / float(this->maxValue);
-                    float_ptr[i * 2 + 1] = float(block_data[i * 2 + 1]) / float(this->maxValue);
+                    out_ptr[(samples_done + i) * 2]     = float(block_data[i * 2])     / float(this->maxValue);
+                    out_ptr[(samples_done + i) * 2 + 1] = float(block_data[i * 2 + 1]) / float(this->maxValue);
                 }
             }
-            out_ptr += block_complex * 2;
             samples_done += block_complex;
             rxReadIndex = (rxReadIndex + 1) % DEFAULT_NUM_BUFFERS;
         } else {
-            // Copy part of block, save leftovers for next call
+            // Copy part of block, save leftovers
             if (rxUseShort) {
-                std::memcpy(out_ptr, block_data, needed * 2 * sizeof(int16_t));
+                int16_t *out_ptr = reinterpret_cast<int16_t *>(output_buf);
+                for (size_t i = 0; i < needed * 2; ++i)
+                    out_ptr[samples_done * 2 + i] = block_data[i];
             } else {
-                float *float_ptr = reinterpret_cast<float *>(out_ptr);
+                float *out_ptr = reinterpret_cast<float *>(output_buf);
                 for (size_t i = 0; i < needed; ++i) {
-                    float_ptr[i * 2]     = float(block_data[i * 2])     / float(this->maxValue);
-                    float_ptr[i * 2 + 1] = float(block_data[i * 2 + 1]) / float(this->maxValue);
+                    out_ptr[(samples_done + i) * 2]     = float(block_data[i * 2])     / float(this->maxValue);
+                    out_ptr[(samples_done + i) * 2 + 1] = float(block_data[i * 2 + 1]) / float(this->maxValue);
                 }
             }
-            out_ptr += needed * 2;
-            samples_done += needed;
-
-            // Store leftover samples
+            // Save leftovers for next call
             size_t leftovers = block_complex - needed;
             rx_fifo_buffer.resize(leftovers * 2);
-            std::memcpy(rx_fifo_buffer.data(), block_data + needed * 2, leftovers * 2 * sizeof(int16_t));
+            for (size_t i = 0; i < leftovers * 2; ++i)
+                rx_fifo_buffer[i] = block_data[needed * 2 + i];
             rx_fifo_offset = 0;
+            samples_done += needed;
             rxReadIndex = (rxReadIndex + 1) % DEFAULT_NUM_BUFFERS;
         }
     }
-
     return samples_done;
 }
 
