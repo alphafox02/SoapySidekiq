@@ -1149,7 +1149,7 @@ int SoapySidekiq::readStream(
     bool timestamp_set = false;
     long waitTime = (timeoutUs == 0) ? SLEEP_1SEC : timeoutUs;
 
-    // Output pointer
+    // Output pointer (void*, could be int16_t* or float*)
     void *output_buf = buffs[0];
 
     while (samples_done < numElems) {
@@ -1160,7 +1160,7 @@ int SoapySidekiq::readStream(
 
             if (rxUseShort) {
                 int16_t *out_ptr = reinterpret_cast<int16_t *>(output_buf);
-                std::memcpy(
+                memcpy(
                     out_ptr + samples_done * 2,
                     rx_fifo_buffer.data() + rx_fifo_offset * 2,
                     to_copy * 2 * sizeof(int16_t));
@@ -1191,7 +1191,7 @@ int SoapySidekiq::readStream(
         }
 
         skiq_rx_block_t *block_ptr = p_rx_block[rxReadIndex];
-        const volatile int16_t *block_data = block_ptr->data; // FIXED: don't cast away volatile
+        const volatile int16_t *block_data = block_ptr->data; // DO NOT cast away volatile
         size_t block_complex = rx_payload_size_in_words;
 
         // Set timestamp on first sample delivered
@@ -1209,8 +1209,11 @@ int SoapySidekiq::readStream(
         if (needed >= block_complex) {
             if (rxUseShort) {
                 int16_t *out_ptr = reinterpret_cast<int16_t *>(output_buf);
-                for (size_t i = 0; i < block_complex * 2; ++i)
-                    out_ptr[samples_done * 2 + i] = block_data[i];
+                // Use memcpy, casting block_data to const void* is fine
+                memcpy(
+                    out_ptr + samples_done * 2,
+                    (const void *)block_data,
+                    block_complex * 2 * sizeof(int16_t));
             } else {
                 float *out_ptr = reinterpret_cast<float *>(output_buf);
                 for (size_t i = 0; i < block_complex; ++i) {
@@ -1221,11 +1224,13 @@ int SoapySidekiq::readStream(
             samples_done += block_complex;
             rxReadIndex = (rxReadIndex + 1) % DEFAULT_NUM_BUFFERS;
         } else {
-            // Copy part of block, save leftovers
+            // Copy part of block, save leftovers for next call
             if (rxUseShort) {
                 int16_t *out_ptr = reinterpret_cast<int16_t *>(output_buf);
-                for (size_t i = 0; i < needed * 2; ++i)
-                    out_ptr[samples_done * 2 + i] = block_data[i];
+                memcpy(
+                    out_ptr + samples_done * 2,
+                    (const void *)block_data,
+                    needed * 2 * sizeof(int16_t));
             } else {
                 float *out_ptr = reinterpret_cast<float *>(output_buf);
                 for (size_t i = 0; i < needed; ++i) {
