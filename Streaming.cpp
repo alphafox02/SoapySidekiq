@@ -673,11 +673,19 @@ int SoapySidekiq::deactivateStream(SoapySDR::Stream *stream, const int flags,
             status = skiq_stop_rx_streaming_on_1pps(card, rx_hdl, 0);
             if (status != 0)
             {
-                SoapySDR_logf(SOAPY_SDR_ERROR,
-                        "skiq_stop_rx_streaming_on_1pps failed, (card %u) handle "
-                        "%d, status %d",
+                if (status == -19) // Handle not streaming
+                {
+                    SoapySDR_logf(SOAPY_SDR_WARNING,
+                        "skiq_stop_rx_streaming_on_1pps: handle not streaming (card %u, handle %d), ignoring",
+                        card, rx_hdl);
+                }
+                else
+                {
+                    SoapySDR_logf(SOAPY_SDR_ERROR,
+                        "skiq_stop_rx_streaming_on_1pps failed, (card %u) handle %d, status %d",
                         card, rx_hdl, status);
-                throw std::runtime_error("");
+                    throw std::runtime_error("");
+                }
             }
         }
         else
@@ -685,11 +693,19 @@ int SoapySidekiq::deactivateStream(SoapySDR::Stream *stream, const int flags,
             status = skiq_stop_rx_streaming(card, rx_hdl);
             if (status != 0)
             {
-                SoapySDR_logf(SOAPY_SDR_ERROR,
-                        "skiq_stop_rx_streaming failed, (card %u) handle "
-                        "%d, status %d",
+                if (status == -19) // Handle not streaming
+                {
+                    SoapySDR_logf(SOAPY_SDR_WARNING,
+                        "skiq_stop_rx_streaming: handle not streaming (card %u, handle %d), ignoring",
+                        card, rx_hdl);
+                }
+                else
+                {
+                    SoapySDR_logf(SOAPY_SDR_ERROR,
+                        "skiq_stop_rx_streaming failed, (card %u) handle %d, status %d",
                         card, rx_hdl, status);
-                throw std::runtime_error("");
+                    throw std::runtime_error("");
+                }
             }
         }
 
@@ -707,11 +723,19 @@ int SoapySidekiq::deactivateStream(SoapySDR::Stream *stream, const int flags,
             status = skiq_stop_tx_streaming_on_1pps(card, tx_hdl, 0);
             if (status != 0)
             {
-                SoapySDR_logf(
-                        SOAPY_SDR_ERROR,
+                if (status == -19)
+                {
+                    SoapySDR_logf(SOAPY_SDR_WARNING,
+                        "skiq_stop_tx_streaming_on_1pps: handle not streaming (card %u, handle %d), ignoring",
+                        card, tx_hdl);
+                }
+                else
+                {
+                    SoapySDR_logf(SOAPY_SDR_ERROR,
                         "skiq_stop_tx_streaming_on_1pps failed (card %u), status %d",
                         card, status);
-                throw std::runtime_error("");
+                    throw std::runtime_error("");
+                }
             }
 
             /* verify the tx thread is done */
@@ -726,14 +750,21 @@ int SoapySidekiq::deactivateStream(SoapySDR::Stream *stream, const int flags,
             status = skiq_stop_tx_streaming(card, tx_hdl);
             if (status != 0)
             {
-                SoapySDR_logf(
-                        SOAPY_SDR_ERROR,
+                if (status == -19)
+                {
+                    SoapySDR_logf(SOAPY_SDR_WARNING,
+                        "skiq_stop_tx_streaming: handle not streaming (card %u, handle %d), ignoring",
+                        card, tx_hdl);
+                }
+                else
+                {
+                    SoapySDR_logf(SOAPY_SDR_ERROR,
                         "skiq_stop_tx_streaming failed (card %u), status %d",
                         card, status);
-                throw std::runtime_error("");
+                    throw std::runtime_error("");
+                }
             }
         }
-
     }
 
     return 0;
@@ -747,39 +778,60 @@ int SoapySidekiq::readStream(
     long long &timeNs,
     const long timeoutUs)
 {
-    if (stream != RX_STREAM)
-        return SOAPY_SDR_NOT_SUPPORTED;
-    else if (rx_receive_operation_exited_due_to_error)
-        return SOAPY_SDR_STREAM_ERROR;
+    if (stream != RX_STREAM) return SOAPY_SDR_NOT_SUPPORTED;
+    if (rx_receive_operation_exited_due_to_error) return SOAPY_SDR_STREAM_ERROR;
 
-    long waitTime = timeoutUs;
-    if (waitTime == 0)
-        waitTime = SLEEP_1SEC;
-
-    char *buff_ptr = (char *)buffs[0];
-    size_t samples_written = 0;
+    size_t samples_done = 0;
     bool timestamp_set = false;
+    long waitTime = (timeoutUs == 0) ? SLEEP_1SEC : timeoutUs;
 
-    while (samples_written < numElems)
-    {
-        // Wait for buffer to be available
-        while ((rxReadIndex == rxWriteIndex) && (waitTime > 0))
-        {
+    // Output pointer (void*, could be int16_t* or float*)
+    void *output_buf = buffs[0];
+
+    while (samples_done < numElems) {
+        // Consume any FIFO buffer leftovers first
+        size_t fifo_left = (rx_fifo_buffer.size() / 2) - rx_fifo_offset;
+        if (fifo_left > 0) {
+            size_t to_copy = std::min(fifo_left, numElems - samples_done);
+
+            if (rxUseShort) {
+                int16_t *out_ptr = reinterpret_cast<int16_t *>(output_buf);
+                memcpy(
+                    out_ptr + samples_done * 2,
+                    rx_fifo_buffer.data() + rx_fifo_offset * 2,
+                    to_copy * 2 * sizeof(int16_t));
+            } else {
+                float *out_ptr = reinterpret_cast<float *>(output_buf);
+                for (size_t i = 0; i < to_copy; ++i) {
+                    out_ptr[(samples_done + i) * 2]     = float(rx_fifo_buffer[(rx_fifo_offset + i) * 2])     / float(this->maxValue);
+                    out_ptr[(samples_done + i) * 2 + 1] = float(rx_fifo_buffer[(rx_fifo_offset + i) * 2 + 1]) / float(this->maxValue);
+                }
+            }
+            rx_fifo_offset += to_copy;
+            samples_done += to_copy;
+
+            if (rx_fifo_offset * 2 >= rx_fifo_buffer.size()) {
+                rx_fifo_buffer.clear();
+                rx_fifo_offset = 0;
+            }
+            continue;
+        }
+
+        // Wait for a new block in the ring buffer
+        while ((rxReadIndex == rxWriteIndex) && (waitTime > 0)) {
             usleep(DEFAULT_SLEEP_US);
             waitTime -= DEFAULT_SLEEP_US;
         }
-        if (waitTime <= 0)
-            return samples_written > 0 ? samples_written : SOAPY_SDR_TIMEOUT;
+        if (waitTime <= 0) {
+            return (samples_done > 0) ? samples_done : SOAPY_SDR_TIMEOUT;
+        }
 
         skiq_rx_block_t *block_ptr = p_rx_block[rxReadIndex];
-        char *ringbuffer_ptr = (char *)block_ptr->data;
+        const volatile int16_t *block_data = block_ptr->data; // DO NOT cast away volatile
+        size_t block_complex = rx_payload_size_in_words;
 
-        size_t block_samples = rx_payload_size_in_words;
-        size_t samples_left = numElems - samples_written;
-        size_t copy_samples = std::min(block_samples, samples_left);
-
-        if (!timestamp_set)
-        {
+        // Set timestamp on first sample delivered
+        if (!timestamp_set) {
             if (this->rfTimeSource)
                 timeNs = convert_timestamp_to_nanos(block_ptr->rf_timestamp, rx_sample_rate);
             else
@@ -788,34 +840,51 @@ int SoapySidekiq::readStream(
             timestamp_set = true;
         }
 
-        if (rxUseShort)
-        {
-            memcpy(buff_ptr, ringbuffer_ptr, copy_samples * sizeof(int16_t) * 2);
-        }
-        else
-        {
-            float *dbuff_ptr = (float *)buff_ptr;
-            int16_t *source = (int16_t *)ringbuffer_ptr;
-            int short_ctr = 0;
-            for (size_t i = 0; i < copy_samples; i++)
-            {
-                *dbuff_ptr++ = (float)source[short_ctr + 1] / this->maxValue;
-                *dbuff_ptr++ = (float)source[short_ctr] / this->maxValue;
-                short_ctr += 2;
+        size_t needed = numElems - samples_done;
+
+        if (needed >= block_complex) {
+            if (rxUseShort) {
+                int16_t *out_ptr = reinterpret_cast<int16_t *>(output_buf);
+                // Use memcpy, casting block_data to const void* is fine
+                memcpy(
+                    out_ptr + samples_done * 2,
+                    (const void *)block_data,
+                    block_complex * 2 * sizeof(int16_t));
+            } else {
+                float *out_ptr = reinterpret_cast<float *>(output_buf);
+                for (size_t i = 0; i < block_complex; ++i) {
+                    out_ptr[(samples_done + i) * 2]     = float(block_data[i * 2])     / float(this->maxValue);
+                    out_ptr[(samples_done + i) * 2 + 1] = float(block_data[i * 2 + 1]) / float(this->maxValue);
+                }
             }
-        }
-
-        buff_ptr += copy_samples * sizeof(int16_t) * 2;
-        samples_written += copy_samples;
-
-        // If we consumed the whole block, advance ring index
-        if (copy_samples == block_samples)
+            samples_done += block_complex;
             rxReadIndex = (rxReadIndex + 1) % DEFAULT_NUM_BUFFERS;
-        else
-            break; // Only partially consumed, will get the rest next call
+        } else {
+            // Copy part of block, save leftovers for next call
+            if (rxUseShort) {
+                int16_t *out_ptr = reinterpret_cast<int16_t *>(output_buf);
+                memcpy(
+                    out_ptr + samples_done * 2,
+                    (const void *)block_data,
+                    needed * 2 * sizeof(int16_t));
+            } else {
+                float *out_ptr = reinterpret_cast<float *>(output_buf);
+                for (size_t i = 0; i < needed; ++i) {
+                    out_ptr[(samples_done + i) * 2]     = float(block_data[i * 2])     / float(this->maxValue);
+                    out_ptr[(samples_done + i) * 2 + 1] = float(block_data[i * 2 + 1]) / float(this->maxValue);
+                }
+            }
+            // Save leftovers for next call
+            size_t leftovers = block_complex - needed;
+            rx_fifo_buffer.resize(leftovers * 2);
+            for (size_t i = 0; i < leftovers * 2; ++i)
+                rx_fifo_buffer[i] = block_data[needed * 2 + i];
+            rx_fifo_offset = 0;
+            samples_done += needed;
+            rxReadIndex = (rxReadIndex + 1) % DEFAULT_NUM_BUFFERS;
+        }
     }
-
-    return samples_written;
+    return samples_done;
 }
 
 int SoapySidekiq::writeStream(SoapySDR::Stream * stream,

@@ -144,7 +144,16 @@ class SoapySidekiq : public SoapySDR::Device
 
         void setGain(const int direction,
                 const size_t channel,
+                const std::string &name,
                 const double value);
+
+        void setGain(const int direction,
+                const size_t channel,
+                const double value) override;
+ 
+        double getGain(const int direction,
+                const size_t channel,
+                const std::string &name) const override;
 
         double getGain(const int direction,
                 const size_t channel) const;

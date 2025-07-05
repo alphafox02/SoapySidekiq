@@ -726,111 +726,105 @@ bool SoapySidekiq::getGainMode(const int direction, const size_t channel) const
     return false;
 }
 
-void SoapySidekiq::setGain(const int direction, const size_t channel,
-                           const double value)
+void SoapySidekiq::setGain(const int direction, const size_t channel, const std::string &name, const double value)
 {
-    int status;
-    uint8_t gain_index = 0;
+    setGain(direction, channel, value);
+}
 
-    SoapySDR_logf(SOAPY_SDR_TRACE, "setGain");
+void SoapySidekiq::setGain(const int direction, const size_t channel, const double value)
+{
+    int status = 0;
+    SoapySDR_logf(SOAPY_SDR_TRACE, "setGain called with direction %d, channel %zu, value %.1f", direction, channel, value);
 
     if (direction == SOAPY_SDR_RX)
     {
-        /* if gain mode is automatic, we should leave */
-        if (!getGainMode(direction, channel))
+        this->rx_hdl = static_cast<skiq_rx_hdl_t>(channel);
+
+        // 1. Read current gain mode
+        skiq_rx_gain_t gain_mode;
+        status = skiq_read_rx_gain_mode(card, this->rx_hdl, &gain_mode);
+        if (status != 0)
         {
-            this->rx_hdl = static_cast<skiq_rx_hdl_t>(channel);
+            SoapySDR_logf(SOAPY_SDR_ERROR,
+                "skiq_read_rx_gain_mode failed (card %u, channel %zu), status %d",
+                card, channel, status);
+            throw std::runtime_error("");
+        }
 
-            // convert value from dB to index based upon the card type
-            switch (part)
-            {
-                // 0 to 76 [0 to 76 dB, 1 dB/step]
-                case skiq_mpcie:
-                case skiq_m2:
-                case skiq_m2_2280:
-                case skiq_z2:
-                case skiq_z3u:
-                    if ((value < 0) || (value > 76))
-                    {
-                        SoapySDR_logf(SOAPY_SDR_WARNING,
-                                "card: %u, invalid requested gain: %3.0f dB, acceptable range: "
-                                "0 - 76 dB \nno gain configured",
-                                card, value);
-                        return;
-                    }
-
-                    gain_index = (uint8_t)static_cast<int>(value);
-                    break;
-
-                    // 195 to 255 [0 to 30 dB (Rx1/Rx2), 0.5 dB/step]
-                case skiq_x4:
-                case skiq_x2:
-                    if ((value < 0) || (value > 30))
-                    {
-                        SoapySDR_logf(SOAPY_SDR_WARNING,
-                                "card: %u, invalid requested gain: %3.0f dB, acceptable range: "
-                                "0 - 30 dB \nno gain configured",
-                                card, value);
-                        return;
-                    }
-
-                    gain_index = (uint8_t)(195 + (static_cast<int>(value) * 2));
-                    break;
-
-
-                    // 187 to 255 [0 to 34 dB, 0.5 dB/step]
-                case skiq_nv100:
-                    if ((value < 0) || (value > 34))
-                    {
-                        SoapySDR_logf(SOAPY_SDR_WARNING,
-                                "card: %u, invalid requested gain: %3.0f dB, acceptable range: "
-                                "0 - 34 dB \nno gain configured",
-                                card, value);
-                        return;
-                    }
-
-                    gain_index = (uint8_t)(187 + (static_cast<int>(value) * 2));
-                    break;
-
-                default:
-                    SoapySDR_logf(SOAPY_SDR_WARNING, "card: %u, invalid card type %u",
-                            card, (uint8_t)part);
-                    return;
-                    break;
-            }
-
-            uint16_t gain = (uint16_t)(abs(value));
-            status        = skiq_write_rx_gain(card, rx_hdl, gain_index);
+        // 2. Force manual mode if currently in auto
+        if (gain_mode == skiq_rx_gain_auto)
+        {
+            SoapySDR_logf(SOAPY_SDR_INFO, "Gain mode was auto, switching to manual for explicit gain setting.");
+            status = skiq_write_rx_gain_mode(card, this->rx_hdl, skiq_rx_gain_manual);
             if (status != 0)
             {
                 SoapySDR_logf(SOAPY_SDR_ERROR,
-                    "skiq_write_rx_gain failed (card %u, value %d) status %d",
-                    card, gain, status);
-                    throw std::runtime_error("");
+                    "skiq_write_rx_gain_mode failed (card %u, channel %zu), status %d",
+                    card, channel, status);
+                throw std::runtime_error("");
             }
-            SoapySDR_logf(SOAPY_SDR_INFO, "Setting rx gain to: %2.0f dB, gain index: %u",
-                          value, gain_index);
         }
-        else
+
+        // 3. Query gain index range from hardware
+        uint8_t gain_min = 0, gain_max = 0;
+        status = skiq_read_rx_gain_index_range(card, this->rx_hdl, &gain_min, &gain_max);
+        if (status != 0)
         {
-            SoapySDR_log(SOAPY_SDR_WARNING,
-                         "Attempt to set gain even though it"
-                         " was already set to automatic gain mode");
-            return;
+            SoapySDR_logf(SOAPY_SDR_ERROR,
+                "skiq_read_rx_gain_index_range failed (card %u, channel %zu), status %d",
+                card, channel, status);
+            throw std::runtime_error("");
+        }
+
+        // 4. Map value in dB to hardware index per device type
+        uint8_t gain_index = gain_min;
+        switch (part)
+        {
+            case skiq_mpcie:
+            case skiq_m2:
+            case skiq_m2_2280:
+            case skiq_z2:
+            case skiq_z3u:
+                gain_index = (uint8_t)std::round(value); // 1dB/step, 0..76
+                break;
+            case skiq_x4:
+            case skiq_x2:
+                gain_index = (uint8_t)(195 + std::round(value * 2.0)); // 0.5dB/step, starts at 195
+                break;
+            case skiq_nv100:
+                gain_index = (uint8_t)(187 + std::round(value * 2.0)); // 0.5dB/step, starts at 187
+                break;
+            default:
+                SoapySDR_logf(SOAPY_SDR_WARNING, "Unknown card type: %u. Not setting gain.", (uint8_t)part);
+                return;
+        }
+
+        // 5. Clamp gain index to allowed range
+        if (gain_index < gain_min) gain_index = gain_min;
+        if (gain_index > gain_max) gain_index = gain_max;
+
+        SoapySDR_logf(SOAPY_SDR_INFO,
+            "card: %u, handle: %u, Set RX gain: requested %.1f dB (gain_index: %u), range: [%u-%u], set: %u",
+            card, this->rx_hdl, value, gain_index, gain_min, gain_max, gain_index);
+
+        // 6. Actually set the gain
+        status = skiq_write_rx_gain(card, rx_hdl, gain_index);
+        if (status != 0)
+        {
+            SoapySDR_logf(SOAPY_SDR_ERROR,
+                "skiq_write_rx_gain failed (card %u, gain_index %u), status %d",
+                card, gain_index, status);
+            throw std::runtime_error("");
         }
     }
-
-    /* For TX gain is attenuation 
-     * so a gain of 0 is max attenuation_index. A large gain, is a smaller attenuation index */
     else if (direction == SOAPY_SDR_TX)
     {
+        // For completeness, update TX as you already do...
         uint16_t attenuation_index = 0;
         uint32_t max_attenuation_index = this->param.tx_param[tx_hdl].atten_quarter_db_max;
 
-        // convert value from dB to index based upon the card type
         switch (part)
         {
-            // 0 to 359 [0 to 89.75 dB, 0.25 dB/step]
             case skiq_mpcie:
             case skiq_m2:
             case skiq_m2_2280:
@@ -839,52 +833,41 @@ void SoapySidekiq::setGain(const int direction, const size_t channel,
                 if ((value < 0) || (value > 89.75))
                 {
                     SoapySDR_logf(SOAPY_SDR_WARNING,
-                        "card: %u, invalid requested attenuation: %3.0f dB, acceptable range: "
-                        "0 - 89.75 dB \nno attenuation configured",
+                        "card: %u, invalid requested attenuation: %3.0f dB, acceptable range: 0 - 89.75 dB. No attenuation configured.",
                         card, value);
                     return;
                 }
-
-                attenuation_index = max_attenuation_index - 
-                                        (uint16_t)static_cast<int>(value * 4);
+                attenuation_index = max_attenuation_index - (uint16_t)std::round(value * 4.0);
                 break;
 
-            // 0 to 167 [0 to 41.75 dB, 0.25 dB/step]
             case skiq_x4:
             case skiq_x2:
             case skiq_nv100:
                 if ((value < 0) || (value > 41.75))
                 {
                     SoapySDR_logf(SOAPY_SDR_WARNING,
-                        "card: %u, invalid requested attenuation: %3.0f dB, acceptable range: "
-                        "0 - 41.75 dB \nno attenuation configured",
+                        "card: %u, invalid requested attenuation: %3.0f dB, acceptable range: 0 - 41.75 dB. No attenuation configured.",
                         card, value);
                     return;
                 }
-
-                attenuation_index = max_attenuation_index - 
-                                        (uint16_t)static_cast<int>(value * 4);
+                attenuation_index = max_attenuation_index - (uint16_t)std::round(value * 4.0);
                 break;
 
             default:
-                SoapySDR_logf(SOAPY_SDR_WARNING,
-                        "card: %u, invalid card type %u",
-                        card, (uint8_t)part);
+                SoapySDR_logf(SOAPY_SDR_WARNING, "Unknown card type: %u. Not setting TX attenuation.", (uint8_t)part);
                 return;
-                break;
         }
 
         status = skiq_write_tx_attenuation(card, tx_hdl, attenuation_index);
         if (status != 0)
         {
             SoapySDR_logf(SOAPY_SDR_ERROR,
-                          "skiq_write_tx_gain failed, (card %u, value %f), status %d",
-                          card, attenuation_index, status);
+                "skiq_write_tx_gain failed, (card %u, value %f), status %d",
+                card, attenuation_index, status);
             throw std::runtime_error("");
         }
-        SoapySDR_logf(SOAPY_SDR_INFO, "card: %u, Setting tx attenuation: %2.0f dB, "
-                      "attenuation index: %d",
-                      card, value, attenuation_index);
+        SoapySDR_logf(SOAPY_SDR_INFO, "card: %u, Setting tx attenuation: %2.2f dB, attenuation index: %d",
+            card, value, attenuation_index);
     }
     else
     {
@@ -893,51 +876,43 @@ void SoapySidekiq::setGain(const int direction, const size_t channel,
     }
 }
 
+double SoapySidekiq::getGain(const int direction, const size_t channel, const std::string &name) const
+{
+    return getGain(direction, channel);
+}
+
 double SoapySidekiq::getGain(const int direction, const size_t channel) const
 {
     int status = 0;
-
-    SoapySDR_logf(SOAPY_SDR_TRACE, "getGain, ");
+    SoapySDR_logf(SOAPY_SDR_TRACE, "getGain, direction: %d channel: %zu", direction, channel);
 
     if (direction == SOAPY_SDR_RX)
     {
         uint8_t gain_index;
-        status = skiq_read_rx_gain((uint8_t)card, (skiq_rx_hdl_t)this->rx_hdl, &gain_index);
+        status = skiq_read_rx_gain(card, static_cast<skiq_rx_hdl_t>(channel), &gain_index);
         if (status != 0)
         {
             SoapySDR_logf(SOAPY_SDR_ERROR,
-                          "skiq_read_rx_gain failed (card %u), rx_hdl %u, status %d",
-                          this->card, this->rx_hdl, status);
+                "skiq_read_rx_gain failed (card %u), rx_hdl %zu, status %d",
+                card, channel, status);
             throw std::runtime_error("");
         }
 
-        // convert index to  dB based upon the card type
         switch (part)
         {
-            // 0 to 76 [0 to 76 dB, 1 dB/step]
             case skiq_mpcie:
             case skiq_m2:
             case skiq_m2_2280:
             case skiq_z2:
             case skiq_z3u:
-                return static_cast<double>(gain_index);
-                break;
-
-            // 195 to 255 [0 to 30 dB, 0.5 dB/step]
+                return static_cast<double>(gain_index); // 1dB/step
             case skiq_x2:
             case skiq_x4:
-                return static_cast<double>((gain_index - 195) / 2);
-                break;
-
-            // 187 to 255 [0 to 34 dB, 0.5 dB/step]
+                return static_cast<double>(gain_index - 195) / 2.0; // 0.5dB/step
             case skiq_nv100:
-                return static_cast<double>((gain_index - 187) / 2);
-                break;
-
+                return static_cast<double>(gain_index - 187) / 2.0;
             default:
-                SoapySDR_logf(SOAPY_SDR_WARNING,
-                              "card: %u, invalid card type %u",
-                              card, (uint8_t)part);
+                SoapySDR_logf(SOAPY_SDR_WARNING, "card: %u, invalid card type %u", card, (uint8_t)part);
                 break;
         }
     }
@@ -950,36 +925,12 @@ double SoapySidekiq::getGain(const int direction, const size_t channel) const
         if (status != 0)
         {
             SoapySDR_logf(SOAPY_SDR_ERROR,
-                          "skiq_read_tx_attenuation failed (card %u), status %d",
-                          card, status);
+                "skiq_read_tx_attenuation failed (card %u), status %d",
+                card, status);
             throw std::runtime_error("");
         }
 
-        // convert value from dB to index based upon the card type
-        switch (part)
-        {
-            // 0 to 359 [0 to 89.75 dB, 0.25 dB/step]
-            case skiq_mpcie:
-            case skiq_m2:
-            case skiq_m2_2280:
-            case skiq_z2:
-            case skiq_z3u:
-                return (max_attenuation_index - static_cast<int>(attenuation_index)) / 4.0;
-                break;
-
-            // 0 to 167 [0 to 41.75 dB, 0.25 dB/step]
-            case skiq_x4:
-            case skiq_x2:
-            case skiq_nv100:
-                return (max_attenuation_index - static_cast<int>(attenuation_index)) / 4.0;
-                break;
-
-            default:
-                SoapySDR_logf(SOAPY_SDR_WARNING,
-                        "card: %u, invalid card type %u",
-                        card, (uint8_t)part);
-                break;
-        }
+        return (max_attenuation_index - static_cast<int>(attenuation_index)) / 4.0;
     }
     else
     {
