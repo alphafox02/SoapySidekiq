@@ -1,5 +1,8 @@
 # Soapy SDR module for Epiq Solutions Sidekiq
 
+# need to set the LD_LIBRARY_PATH to point to the epiq solutions library
+$ export LD_LIBRARY_PATH="/usr/local/lib:/usr/lib/epiq:/usr/lib/epiq:$LD_LIBRARY_PATH"
+
 # Building using the install.sh script
 $ ./install.sh
 
@@ -9,7 +12,7 @@ $ ./install.sh PLATFORM="msiq-g20g40"  or "msiq-x40", "msiq-z3u"
 
 # More detailed make and install info:
 
-# Building for non-platform cards:
+# Building 
 Use the normal build process for cmake projects:
 
 $ mkdir build
@@ -24,7 +27,6 @@ $ sudo make install
 
 $ sudo ldconfig 
 
-
 # Building for the X40:
 **SoapySDR** must be installed from source if using it with the X40.
 
@@ -38,9 +40,8 @@ So we need to run:
 ```
 $ cmake .. -DPython3_EXECUTABLE=/usr/bin/python3.8 -DPython3_INCLUDE_DIR=/usr/include/python3.8 -DPython3_LIBRARY=/usr/lib/aarch64-linux-gnu/libpython3.8.so
 
-We also need to make sure PYTHONPATH and LD_LIBRARY_PATH are set correctly:
+We also need to make sure PYTHONPATH is set correctly:
 
-$ export LD_LIBRARY_PATH="/usr/local/lib:/usr/lib/epiq:/usr/lib/epiq:$LD_LIBRARY_PATH"
 ```
 
 ```
