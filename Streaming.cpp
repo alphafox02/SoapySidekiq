@@ -144,12 +144,15 @@ void SoapySidekiq::rx_receive_operation_impl(void)
     bool first = true;
     uint64_t last_timestamp = 0;
     uint64_t overrun_counter = 0;
+    uint64_t overload = 0; // Restored overload variable
+    uint64_t expected_timestamp = 0; // Re-added per original structure
     skiq_rx_hdl_t rcvd_hdl;
 
     std::unique_lock<std::mutex> lock(rx_mutex);
 
     SoapySDR_log(SOAPY_SDR_TRACE, "entering rx_receive_thread");
 
+    // wait till called to start running
     _cv.wait(lock, [this] { return rx_start_signal; });
 
     SoapySDR_log(SOAPY_SDR_INFO, "Starting RX Sidekiq Thread loop");
@@ -165,6 +168,12 @@ void SoapySidekiq::rx_receive_operation_impl(void)
             overrun_counter++;
         }
 
+        /*
+         * put the block into a ring buffer so readStream can read it out
+         * at a different pace
+         * skiq_receive is in blocking mode, so it will allow the other
+         * threads to run
+         */
         status = skiq_receive(card, &rcvd_hdl, &tmp_p_rx_block, &len);
         if (status == skiq_rx_status_success)
         {
@@ -177,17 +186,18 @@ void SoapySidekiq::rx_receive_operation_impl(void)
                     throw std::runtime_error("");
                 }
 
-                // --- Timestamp integrity check, like gr-sidekiq ---
+                overload = tmp_p_rx_block->overload; // Restore overload fetch per review
+
                 uint64_t this_timestamp = tmp_p_rx_block->rf_timestamp;
                 if (!first)
                 {
-                    uint64_t expected_ts = last_timestamp + rx_payload_size_in_words;
-                    if (this_timestamp != expected_ts)
+                    expected_timestamp = last_timestamp + rx_payload_size_in_words;
+                    if (this_timestamp != expected_timestamp)
                     {
                         SoapySDR_log(SOAPY_SDR_WARNING,
                                      "Detected timestamp overflow/missed samples in RX Sidekiq Thread");
                         SoapySDR_logf(SOAPY_SDR_DEBUG, "expected timestamp %lu, actual %lu",
-                                      expected_ts, this_timestamp);
+                                      expected_timestamp, this_timestamp);
                         first = true; // restart
                     }
                 }
@@ -197,7 +207,6 @@ void SoapySidekiq::rx_receive_operation_impl(void)
                 }
                 last_timestamp = this_timestamp;
 
-                // Copy into RAM ring buffer
                 memcpy(p_rx_block[rxWriteIndex], (void *)tmp_p_rx_block, len);
                 rxWriteIndex = (rxWriteIndex + 1) % DEFAULT_NUM_BUFFERS;
             }
@@ -778,18 +787,16 @@ int SoapySidekiq::readStream(
     long long &timeNs,
     const long timeoutUs)
 {
-    if (stream != RX_STREAM) return SOAPY_SDR_NOT_SUPPORTED;
-    if (rx_receive_operation_exited_due_to_error) return SOAPY_SDR_STREAM_ERROR;
+    if (stream != RX_STREAM) { return SOAPY_SDR_NOT_SUPPORTED; }
+    if (rx_receive_operation_exited_due_to_error) { return SOAPY_SDR_STREAM_ERROR; }
 
     size_t samples_done = 0;
     bool timestamp_set = false;
     long waitTime = (timeoutUs == 0) ? SLEEP_1SEC : timeoutUs;
 
-    // Output pointer (void*, could be int16_t* or float*)
     void *output_buf = buffs[0];
 
     while (samples_done < numElems) {
-        // Consume any FIFO buffer leftovers first
         size_t fifo_left = (rx_fifo_buffer.size() / 2) - rx_fifo_offset;
         if (fifo_left > 0) {
             size_t to_copy = std::min(fifo_left, numElems - samples_done);
@@ -817,50 +824,46 @@ int SoapySidekiq::readStream(
             continue;
         }
 
-        // Wait for a new block in the ring buffer
         while ((rxReadIndex == rxWriteIndex) && (waitTime > 0)) {
             usleep(DEFAULT_SLEEP_US);
             waitTime -= DEFAULT_SLEEP_US;
         }
         if (waitTime <= 0) {
+            flags |= SOAPY_SDR_TIMEOUT;
             return (samples_done > 0) ? samples_done : SOAPY_SDR_TIMEOUT;
         }
 
         skiq_rx_block_t *block_ptr = p_rx_block[rxReadIndex];
-        const volatile int16_t *block_data = block_ptr->data; // DO NOT cast away volatile
-        size_t block_complex = rx_payload_size_in_words;
+        const volatile int16_t *block_data = block_ptr->data;
+        size_t block_sample_count = rx_payload_size_in_words;
 
-        // Set timestamp on first sample delivered
         if (!timestamp_set) {
-            if (this->rfTimeSource)
-                timeNs = convert_timestamp_to_nanos(block_ptr->rf_timestamp, rx_sample_rate);
-            else
-                timeNs = convert_timestamp_to_nanos(block_ptr->sys_timestamp, sys_freq);
-            flags = SOAPY_SDR_HAS_TIME;
+            timeNs = this->rfTimeSource ?
+                     convert_timestamp_to_nanos(block_ptr->rf_timestamp, rx_sample_rate) :
+                     convert_timestamp_to_nanos(block_ptr->sys_timestamp, sys_freq);
+            flags |= SOAPY_SDR_HAS_TIME;
             timestamp_set = true;
         }
 
         size_t needed = numElems - samples_done;
 
-        if (needed >= block_complex) {
+        if (needed >= block_sample_count) {
             if (rxUseShort) {
                 int16_t *out_ptr = reinterpret_cast<int16_t *>(output_buf);
-                // Use memcpy, casting block_data to const void* is fine
                 memcpy(
                     out_ptr + samples_done * 2,
                     (const void *)block_data,
-                    block_complex * 2 * sizeof(int16_t));
+                    block_sample_count * 2 * sizeof(int16_t));
             } else {
                 float *out_ptr = reinterpret_cast<float *>(output_buf);
-                for (size_t i = 0; i < block_complex; ++i) {
+                for (size_t i = 0; i < block_sample_count; ++i) {
                     out_ptr[(samples_done + i) * 2]     = float(block_data[i * 2])     / float(this->maxValue);
                     out_ptr[(samples_done + i) * 2 + 1] = float(block_data[i * 2 + 1]) / float(this->maxValue);
                 }
             }
-            samples_done += block_complex;
+            samples_done += block_sample_count;
             rxReadIndex = (rxReadIndex + 1) % DEFAULT_NUM_BUFFERS;
         } else {
-            // Copy part of block, save leftovers for next call
             if (rxUseShort) {
                 int16_t *out_ptr = reinterpret_cast<int16_t *>(output_buf);
                 memcpy(
@@ -874,11 +877,9 @@ int SoapySidekiq::readStream(
                     out_ptr[(samples_done + i) * 2 + 1] = float(block_data[i * 2 + 1]) / float(this->maxValue);
                 }
             }
-            // Save leftovers for next call
-            size_t leftovers = block_complex - needed;
+            size_t leftovers = block_sample_count - needed;
             rx_fifo_buffer.resize(leftovers * 2);
-            for (size_t i = 0; i < leftovers * 2; ++i)
-                rx_fifo_buffer[i] = block_data[needed * 2 + i];
+            memcpy(rx_fifo_buffer.data(), &block_data[needed * 2], leftovers * 2 * sizeof(int16_t));
             rx_fifo_offset = 0;
             samples_done += needed;
             rxReadIndex = (rxReadIndex + 1) % DEFAULT_NUM_BUFFERS;
