@@ -160,7 +160,7 @@ void SoapySidekiq::rx_receive_operation_impl(void)
     while (rx_running)
     {
         // --- Overrun detection: if buffer full, drop half ---
-        int nextWrite = (rxWriteIndex + 1) % DEFAULT_NUM_BUFFERS;
+        uint32_t nextWrite = (rxWriteIndex + 1) % DEFAULT_NUM_BUFFERS;
         if (nextWrite == rxReadIndex)
         {
             SoapySDR_log(SOAPY_SDR_WARNING, "RX ring buffer overrun: client too slow, dropping half buffer");
