@@ -879,7 +879,9 @@ int SoapySidekiq::readStream(
             }
             size_t leftovers = block_sample_count - needed;
             rx_fifo_buffer.resize(leftovers * 2);
-            memcpy(rx_fifo_buffer.data(), &block_data[needed * 2], leftovers * 2 * sizeof(int16_t));
+            memcpy(rx_fifo_buffer.data(),
+                   reinterpret_cast<const void *>(&block_data[needed * 2]),
+                   leftovers * 2 * sizeof(int16_t));
             rx_fifo_offset = 0;
             samples_done += needed;
             rxReadIndex = (rxReadIndex + 1) % DEFAULT_NUM_BUFFERS;
