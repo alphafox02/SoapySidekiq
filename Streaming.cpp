@@ -879,8 +879,11 @@ int SoapySidekiq::readStream(
             }
             size_t leftovers = block_sample_count - needed;
             rx_fifo_buffer.resize(leftovers * 2);
+            const int16_t *nonvolatile_block_data = const_cast<const int16_t *>(
+                reinterpret_cast<volatile const int16_t *>(block_data));
+
             memcpy(rx_fifo_buffer.data(),
-                   reinterpret_cast<const void *>(&block_data[needed * 2]),
+                   &nonvolatile_block_data[needed * 2],
                    leftovers * 2 * sizeof(int16_t));
             rx_fifo_offset = 0;
             samples_done += needed;
