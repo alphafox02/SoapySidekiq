@@ -187,7 +187,12 @@ void SoapySidekiq::rx_receive_operation_impl(void)
                 }
 
                 overload = tmp_p_rx_block->overload; // Restore overload fetch per review
-
+                if (overload != 0)
+                {
+                    SoapySDR_logf(SOAPY_SDR_WARNING,
+                        "RX overload detected on card %u (handle %u)", card, rx_hdl);
+                }
+ 
                 uint64_t this_timestamp = tmp_p_rx_block->rf_timestamp;
                 if (!first)
                 {
