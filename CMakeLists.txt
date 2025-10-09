@@ -1,7 +1,7 @@
 ########################################################################
 # Build Soapy SDR support module for Sidekiq Devices
 ########################################################################
-cmake_minimum_required(VERSION 2.8.7)
+cmake_minimum_required(VERSION 2.8.12...3.10)
 project(SoapySidekiq CXX)
 
 set(CMAKE_CXX_STANDARD 17)
