@@ -7,10 +7,33 @@
 
 if(NOT Sidekiq_FOUND)
 
+    if(DEFINED PLATFORM AND NOT DEFINED SUFFIX)
+        set(SUFFIX "${PLATFORM}")
+    endif()
+
+    set(Sidekiq_ROOT "$ENV{Sidekiq_DIR}" CACHE PATH "Root of the Sidekiq SDK/runtime")
+    if("${Sidekiq_ROOT}" STREQUAL "")
+        set(Sidekiq_ROOT "$ENV{HOME}/sidekiq_sdk_current")
+    endif()
+
     find_path(Sidekiq_INCLUDE_DIR
             NAMES sidekiq_api.h
-            HINTS ${Sidekiq_PKG_INCLUDE_DIRS} $ENV{Sidekiq_DIR}/include
-            PATHS ~/sidekiq_sdk_current/sidekiq_core/inc/ /usr/local/include /usr/include /opt/include /opt/local/include)
+            HINTS
+                ${Sidekiq_PKG_INCLUDE_DIRS}
+                ${Sidekiq_ROOT}/sidekiq_core/inc
+                ${Sidekiq_ROOT}/include/sidekiq
+                ${Sidekiq_ROOT}/include
+                $ENV{Sidekiq_DIR}/sidekiq_core/inc
+                $ENV{Sidekiq_DIR}/include/sidekiq
+                $ENV{Sidekiq_DIR}/include
+            PATHS
+                ~/sidekiq_sdk_current/sidekiq_core/inc/
+                /usr/local/include/sidekiq
+                /usr/local/include
+                /usr/include/sidekiq
+                /usr/include
+                /opt/include
+                /opt/local/include)
 
     execute_process (
         COMMAND uname -m
@@ -25,7 +48,7 @@ if(NOT Sidekiq_FOUND)
         set(SUFFIX "none")  
     endif()
 
-    if (NOT ${cpu_arch} MATCHES "x86_64")
+    if (NOT ${cpu_arch} MATCHES "x86_64" AND ("${SUFFIX}" STREQUAL "none"))
         set(SDK_DIR "$ENV{HOME}/sidekiq_sdk_current/lib")
         file(GLOB LIB_FILES "${SDK_DIR}/libsidekiq__*.a")
 
@@ -35,8 +58,6 @@ if(NOT Sidekiq_FOUND)
             string(REPLACE "libsidekiq__" "" SUFFIX_WITH_EXT "${LIB_NAME}")
             string(REPLACE ".a" "" SUFFIX "${SUFFIX_WITH_EXT}")
             message(STATUS "Detected SDK SUFFIX: ${SUFFIX}")
-        else()
-            message(FATAL_ERROR "No libsidekiq__*.a file found in ${SDK_DIR}")
         endif()
     endif()
 
@@ -70,9 +91,27 @@ if(NOT Sidekiq_FOUND)
     message(STATUS "otherlib is ${otherlib} ")
 
     find_library(Sidekiq_LIBRARY
-        NAMES ${libname}
-        HINTS ${Sidekiq_PKG_LIBRARY_DIRS} $ENV{Sidekiq_DIR}/include
-        PATHS ~/sidekiq_sdk_current/lib/)
+        NAMES
+            ${libname}
+            sidekiq
+            libsidekiq.so
+            libsidekiq.so.4.25.0
+            libsidekiq.so.4.24.0
+            libsidekiq.so.4.23.0
+            libsidekiq.so.4.19.0
+        HINTS
+            ${Sidekiq_PKG_LIBRARY_DIRS}
+            ${Sidekiq_ROOT}/lib
+            ${Sidekiq_ROOT}/lib/support/${SUFFIX}/usr/lib/epiq
+            $ENV{Sidekiq_DIR}/lib
+            $ENV{Sidekiq_DIR}/lib/support/${SUFFIX}/usr/lib/epiq
+        PATHS
+            ~/sidekiq_sdk_current/lib/
+            /usr/lib/epiq
+            /usr/local/lib
+            /usr/lib
+            /opt/lib
+            /opt/local/lib)
 
 
     #    find_library(Sidekiq_LIBRARY
@@ -82,8 +121,54 @@ if(NOT Sidekiq_FOUND)
 
     set(Sidekiq_LIBRARIES ${Sidekiq_LIBRARY})
     set(Sidekiq_INCLUDE_DIRS ${Sidekiq_INCLUDE_DIR})
-    set(Sidekiq_PKG_LIBRARY_DIRS "~/sidekiq_sdk_current/lib/support/${SUFFIX}/usr/lib/epiq")
-    set(ENV{Sidekiq_DIR} "~/sidekiq_sdk_current")
+    set(Sidekiq_PKG_LIBRARY_DIRS "${Sidekiq_ROOT}/lib/support/${SUFFIX}/usr/lib/epiq")
+    set(ENV{Sidekiq_DIR} "${Sidekiq_ROOT}")
+
+    set(Sidekiq_RUNTIME_LIBRARY_HINTS
+        ${Sidekiq_PKG_LIBRARY_DIRS}
+        ${Sidekiq_ROOT}/lib
+        $ENV{Sidekiq_DIR}/lib
+        $ENV{Sidekiq_DIR}/lib/support/${SUFFIX}/usr/lib/epiq)
+
+    find_library(Sidekiq_USB_LIBRARY
+        NAMES usb-1.0 libusb-1.0.so
+        HINTS ${Sidekiq_RUNTIME_LIBRARY_HINTS}
+        PATHS /usr/lib/epiq /usr/local/lib /usr/lib /opt/lib /opt/local/lib)
+
+    find_library(Sidekiq_GLIB_LIBRARY
+        NAMES glib-2.0 libglib-2.0.so
+        HINTS ${Sidekiq_RUNTIME_LIBRARY_HINTS}
+        PATHS /usr/lib/epiq /usr/local/lib /usr/lib /opt/lib /opt/local/lib)
+
+    find_library(Sidekiq_TIRPC_LIBRARY
+        NAMES tirpc libtirpc.so
+        HINTS ${Sidekiq_RUNTIME_LIBRARY_HINTS}
+        PATHS /usr/lib/epiq /usr/local/lib /usr/lib /opt/lib /opt/local/lib)
+
+    find_library(Sidekiq_RT_LIBRARY
+        NAMES rt librt.so
+        PATHS /usr/local/lib /usr/lib /opt/lib /opt/local/lib)
+
+    set(Sidekiq_RUNTIME_LIBRARIES "")
+    foreach(runtime_lib
+            Sidekiq_USB_LIBRARY
+            Sidekiq_GLIB_LIBRARY
+            Sidekiq_TIRPC_LIBRARY)
+        if(${runtime_lib})
+            list(APPEND Sidekiq_RUNTIME_LIBRARIES ${${runtime_lib}})
+        else()
+            message(WARNING
+                    "${runtime_lib} was not found. The build may still work "
+                    "with a shared libsidekiq, but static SDK builds usually "
+                    "need the Epiq support libraries.")
+        endif()
+    endforeach()
+
+    if(Sidekiq_RT_LIBRARY)
+        list(APPEND Sidekiq_RUNTIME_LIBRARIES ${Sidekiq_RT_LIBRARY})
+    else()
+        list(APPEND Sidekiq_RUNTIME_LIBRARIES rt)
+    endif()
 
     if("${cpu_arch}" STREQUAL "x86_64")
         message(STATUS "building for x86_64.gcc")
@@ -95,7 +180,8 @@ if(NOT Sidekiq_FOUND)
 
         set(OTHER_LIBS "")
         set(PKGCONFIG_LIBS "")
-        mark_as_advanced(Sidekiq_INCLUDE_DIRS Sidekiq_LIBRARIES OTHER_LIBS PKGCONFIG_LIBS) 
+        mark_as_advanced(Sidekiq_INCLUDE_DIRS Sidekiq_LIBRARIES
+                         Sidekiq_RUNTIME_LIBRARIES OTHER_LIBS PKGCONFIG_LIBS)
       elseif("${SUFFIX}" MATCHES "^(z3u|aarch64|aarch64\\.gcc6\\.3|arm_cortex-a9\\.gcc7\\.2\\.1_gnueabihf)$")
         message(STATUS "building for aarch")
 
@@ -115,7 +201,8 @@ if(NOT Sidekiq_FOUND)
 
         set(PKGCONFIG_LIBS "")
 
-        mark_as_advanced(Sidekiq_INCLUDE_DIRS Sidekiq_LIBRARIES OTHER_LIBS PKGCONFIG_LIBS) 
+        mark_as_advanced(Sidekiq_INCLUDE_DIRS Sidekiq_LIBRARIES
+                         Sidekiq_RUNTIME_LIBRARIES OTHER_LIBS PKGCONFIG_LIBS)
       elseif("${SUFFIX}" STREQUAL "msiq-x40")
         message(STATUS "building for x40")
 
@@ -156,7 +243,8 @@ if(NOT Sidekiq_FOUND)
 
         set(OTHER_LIBS "")
 
-        mark_as_advanced(Sidekiq_INCLUDE_DIRS Sidekiq_LIBRARIES OTHER_LIBS PKGCONFIG_LIBS) 
+        mark_as_advanced(Sidekiq_INCLUDE_DIRS Sidekiq_LIBRARIES
+                         Sidekiq_RUNTIME_LIBRARIES OTHER_LIBS PKGCONFIG_LIBS)
     else()
       message(STATUS "building for ${SUFFIX}")
         include(FindPackageHandleStandardArgs)
@@ -167,7 +255,8 @@ if(NOT Sidekiq_FOUND)
 
         set(OTHER_LIBS "")
         set(PKGCONFIG_LIBS "")
-        mark_as_advanced(Sidekiq_INCLUDE_DIRS Sidekiq_LIBRARIES OTHER_LIBS PKGCONFIG_LIBS) 
+        mark_as_advanced(Sidekiq_INCLUDE_DIRS Sidekiq_LIBRARIES
+                         Sidekiq_RUNTIME_LIBRARIES OTHER_LIBS PKGCONFIG_LIBS)
     endif()
 
 endif(NOT Sidekiq_FOUND)

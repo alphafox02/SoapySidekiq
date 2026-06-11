@@ -92,7 +92,7 @@ def main(cardno, rx_chan, fs, bw, freq):
     print("read counter", setting)
 
     sdr.setSampleRate(SOAPY_SDR_RX, rx_chan, fs)          # Set sample rate
-    sdr.setBandwidth(SOAPY_SDR_RX, rx_chan, fs)          # Set sample rate
+    sdr.setBandwidth(SOAPY_SDR_RX, rx_chan, bw)          # Set bandwidth
     sdr.setGainMode(SOAPY_SDR_RX, rx_chan, use_agc)       # Set the gain mode
     sdr.setFrequency(SOAPY_SDR_RX, rx_chan, freq)         # Tune the LO
 
@@ -140,7 +140,7 @@ def parse_command_line_arguments():
     parser.add_argument('-r', type=float, required=False, dest='fs',
                         default=2e6, help='Sample Rate')
     parser.add_argument('-b', type=float, required=False, dest='bw',
-                        default=18e6, help='Bandwidth')
+                        default=16e6, help='Bandwidth')
     parser.add_argument('-f', type=float, required=False, dest='freq',
                         default=1000e6, help='Frequency')
 
@@ -162,5 +162,3 @@ if __name__ == '__main__':
     print("freq (-f)\t:", pars.freq/1000000)
 
     main(pars.card, pars.chan, pars.fs, pars.bw, pars.freq)
-
-

@@ -84,15 +84,20 @@ def do_gain(sdr, handle):
     sdr.setGainMode(SOAPY_SDR_RX, handle, True)
     sdr.setGain(SOAPY_SDR_RX, handle, 10)
 
-    # set attenuation
+    # set aggregate TX output level
     sdr.setGain(SOAPY_SDR_TX, handle, 10)
     gain = sdr.getGain(SOAPY_SDR_TX, handle)
-    print(f"\tattenuation value is: {gain}");
+    print(f"\tTX output gain value is: {gain}");
 
-    # set invalid attenuation, should get a warning
+    # set invalid aggregate TX output level, should get a warning
     sdr.setGain(SOAPY_SDR_TX, handle, 100)
     gain = sdr.getGain(SOAPY_SDR_TX, handle)
-    print(f"\tattenuation value is: {gain}");
+    print(f"\tTX output gain value is: {gain}");
+
+    # set direct TX attenuation through the named gain element
+    sdr.setGain(SOAPY_SDR_TX, handle, "attenuation", 10)
+    attenuation = sdr.getGain(SOAPY_SDR_TX, handle, "attenuation")
+    print(f"\tTX attenuation value is: {attenuation}");
     
     # get the rx gain range
     gain_range = sdr.getGainRange(SOAPY_SDR_RX, handle)
@@ -106,11 +111,17 @@ def do_gain(sdr, handle):
     print(f"\tgain range name min {gain_range_name.minimum()}")
     print(f"\tgain range name step {gain_range_name.step()}")
 
-    # get the tx attenuation range
+    # get the aggregate TX output level range
     gain_range = sdr.getGainRange(SOAPY_SDR_TX, handle)
-    print(f"\tattenuation range max {gain_range.maximum()}")
-    print(f"\tattenuation range min {gain_range.minimum()}")
-    print(f"\tattenuation range step {gain_range.step()}")
+    print(f"\tTX output gain range max {gain_range.maximum()}")
+    print(f"\tTX output gain range min {gain_range.minimum()}")
+    print(f"\tTX output gain range step {gain_range.step()}")
+
+    # get the direct TX attenuation range
+    gain_range = sdr.getGainRange(SOAPY_SDR_TX, handle, "attenuation")
+    print(f"\tTX attenuation range max {gain_range.maximum()}")
+    print(f"\tTX attenuation range min {gain_range.minimum()}")
+    print(f"\tTX attenuation range step {gain_range.step()}")
 
 
 def do_frequency(sdr, handle):

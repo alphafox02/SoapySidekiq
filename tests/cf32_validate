@@ -40,7 +40,7 @@ def main(cardno, rx_chan, fs, bw, freq):
     sdr.writeSetting("iq_swap", "false")
 
     sdr.setSampleRate(SOAPY_SDR_RX, rx_chan, fs)          # Set sample rate
-    sdr.setBandwidth(SOAPY_SDR_RX, rx_chan, fs)          # Set sample rate
+    sdr.setBandwidth(SOAPY_SDR_RX, rx_chan, bw)          # Set bandwidth
     sdr.setGainMode(SOAPY_SDR_RX, rx_chan, use_agc)       # Set the gain mode
     sdr.setFrequency(SOAPY_SDR_RX, rx_chan, freq)         # Tune the LO
 
@@ -54,7 +54,7 @@ def main(cardno, rx_chan, fs, bw, freq):
     print("Stream MTU",  N)
 
     # get the full scale value for this card
-    rc = sdr.getNativeStreamFormat(SOAPY_SDR_RX, rx_handle)
+    rc = sdr.getNativeStreamFormat(SOAPY_SDR_RX, rx_chan)
     max_data = int(rc.fullScale)
     SoapySDR.log(SoapySDR.SOAPY_SDR_INFO, f"RX fullscale value: {max_data:,}")
 
@@ -115,7 +115,7 @@ def parse_command_line_arguments():
     parser.add_argument('-s', type=float, required=False, dest='fs',
                         default=20e6, help='Sample Rate')
     parser.add_argument('-bw', type=float, required=False, dest='bw',
-                        default=18e6, help='Bandwidth')
+                        default=16e6, help='Bandwidth')
     parser.add_argument('-f', type=float, required=False, dest='freq',
                         default=1000e6, help='Frequency')
 
@@ -136,5 +136,3 @@ if __name__ == '__main__':
     print("freq (-f)\t:", pars.freq/1000000)
 
     main(pars.card, pars.chan, pars.fs, pars.bw, pars.freq)
-
-

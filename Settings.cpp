@@ -1,8 +1,14 @@
 #include "SoapySidekiq.hpp"
 #include <SoapySDR/Formats.hpp>
+#include <algorithm>
+#include <cerrno>
+#include <cctype>
+#include <cmath>
 #include <cstring>
 #include <cinttypes>
 #include <iostream>
+#include <limits>
+#include <sstream>
 #include <vector>
 #include <string>
 #include <sidekiq_types.h>
@@ -34,7 +40,7 @@ void logging_handler( int32_t priority, const char *message )
     if (len > 0 && new_message[len - 1] == '\r') {
         new_message[len - 1] = '\0';  // Replace newline with null terminator
     }
-    
+
     switch (priority)
     {
         case SKIQ_LOG_DEBUG:
@@ -100,7 +106,7 @@ void SoapySidekiq::tx_complete(int32_t status, skiq_tx_block_t *p_data, uint32_t
 void SoapySidekiq::tx_enabled(uint8_t card, int32_t status)
 {
     SoapySDR_logf(SOAPY_SDR_TRACE, "tx enable received");
-    
+
     // Signal the condition variable
     pthread_mutex_lock(&tx_enabled_mutex);
     pthread_cond_signal(&tx_enabled_cond);
@@ -109,18 +115,1145 @@ void SoapySidekiq::tx_enabled(uint8_t card, int32_t status)
 }
 
 std::vector<SoapySDR::Kwargs> SoapySidekiq::sidekiq_devices;
-bool                          SoapySidekiq::rx_running;
-
+std::mutex SoapySidekiq::sidekiq_init_mutex;
+bool SoapySidekiq::sidekiq_library_initialized = false;
+unsigned SoapySidekiq::sidekiq_instance_count = 0;
+unsigned SoapySidekiq::sidekiq_card_ref_count[SKIQ_MAX_NUM_CARDS] = {};
 
 // compares two strings and if equal range and equal values per character
 // returns true.
 bool equalsIgnoreCase(const std::string& a, const std::string& b)
 {
+    if (a.size() != b.size())
+    {
+        return false;
+    }
+
     return std::equal(a.begin(), a.end(), b.begin(), b.end(),
         [](char a, char b)
         {
             return std::tolower(a) == std::tolower(b);
         });
+}
+
+namespace
+{
+bool rxHandleMayShareLo(const skiq_rx_hdl_t handle)
+{
+    return handle == skiq_rx_hdl_A2 || handle == skiq_rx_hdl_B2;
+}
+
+const char *rxHandleName(const skiq_rx_hdl_t handle)
+{
+    switch (handle)
+    {
+        case skiq_rx_hdl_A1: return "A1";
+        case skiq_rx_hdl_A2: return "A2";
+        case skiq_rx_hdl_B1: return "B1";
+        case skiq_rx_hdl_B2: return "B2";
+        case skiq_rx_hdl_C1: return "C1";
+        case skiq_rx_hdl_D1: return "D1";
+        default: return "unknown";
+    }
+}
+
+const char *txHandleName(const skiq_tx_hdl_t handle)
+{
+    switch (handle)
+    {
+        case skiq_tx_hdl_A1: return "A1";
+        case skiq_tx_hdl_A2: return "A2";
+        case skiq_tx_hdl_B1: return "B1";
+        case skiq_tx_hdl_B2: return "B2";
+        default: return "unknown";
+    }
+}
+
+struct RxGainIndexRange
+{
+    uint8_t minimum;
+    uint8_t maximum;
+};
+
+constexpr double TX_ATTENUATION_STEP_DB = 0.25;
+
+bool isRxGainName(const std::string &name)
+{
+    return equalsIgnoreCase(name, "LNA") ||
+           equalsIgnoreCase(name, "gain") ||
+           equalsIgnoreCase(name, "rx_gain");
+}
+
+bool isTxOutputGainName(const std::string &name)
+{
+    return equalsIgnoreCase(name, "gain") ||
+           equalsIgnoreCase(name, "output_gain") ||
+           equalsIgnoreCase(name, "tx_gain") ||
+           equalsIgnoreCase(name, "LNA");
+}
+
+bool isTxAttenuationName(const std::string &name)
+{
+    return equalsIgnoreCase(name, "attenuation") ||
+           equalsIgnoreCase(name, "attenuator") ||
+           equalsIgnoreCase(name, "attn") ||
+           equalsIgnoreCase(name, "tx_attenuation");
+}
+
+RxGainIndexRange readRxGainIndexRange(const uint8_t card,
+                                      const skiq_rx_hdl_t handle)
+{
+    RxGainIndexRange range{0, 0};
+    const int status = skiq_read_rx_gain_index_range(card,
+                                                     handle,
+                                                     &range.minimum,
+                                                     &range.maximum);
+    if (status != 0)
+    {
+        SoapySDR_logf(SOAPY_SDR_ERROR,
+                      "skiq_read_rx_gain_index_range failed "
+                      "(card %u, handle %u), status %d",
+                      card,
+                      handle,
+                      status);
+        throw std::runtime_error("");
+    }
+
+    if (range.maximum < range.minimum)
+    {
+        throw std::runtime_error("Sidekiq SDK returned an invalid RX gain index range");
+    }
+
+    return range;
+}
+
+double rxGainStepDb(const skiq_part_t part, const skiq_rx_hdl_t handle)
+{
+    switch (part)
+    {
+        case skiq_x2:
+            return handle == skiq_rx_hdl_B1 ? 1.0 : 0.5;
+        case skiq_x4:
+        case skiq_x40:
+        case skiq_nv100:
+        case skiq_nvm2:
+            return 0.5;
+        case skiq_mpcie:
+        case skiq_m2:
+        case skiq_m2_2280:
+        case skiq_z2:
+        case skiq_z3u:
+        default:
+            return 1.0;
+    }
+}
+
+double rxGainDbFromIndex(const skiq_part_t part,
+                         const skiq_rx_hdl_t handle,
+                         const RxGainIndexRange &range,
+                         const uint8_t gain_index)
+{
+    const uint8_t clamped_index =
+        std::max(range.minimum, std::min(range.maximum, gain_index));
+    return static_cast<double>(clamped_index - range.minimum) *
+           rxGainStepDb(part, handle);
+}
+
+uint8_t rxGainIndexFromDb(const skiq_part_t part,
+                          const skiq_rx_hdl_t handle,
+                          const RxGainIndexRange &range,
+                          const double gain_db)
+{
+    const double step = rxGainStepDb(part, handle);
+    const int requested =
+        static_cast<int>(range.minimum) +
+        static_cast<int>(std::llround(gain_db / step));
+    const int clamped = std::max(static_cast<int>(range.minimum),
+                                 std::min(static_cast<int>(range.maximum),
+                                          requested));
+    return static_cast<uint8_t>(clamped);
+}
+
+SoapySDR::Range rxGainRangeDb(const skiq_part_t part,
+                              const skiq_rx_hdl_t handle,
+                              const RxGainIndexRange &range)
+{
+    const double step = rxGainStepDb(part, handle);
+    return SoapySDR::Range(0.0,
+                           static_cast<double>(range.maximum - range.minimum) *
+                               step,
+                           step);
+}
+
+struct TxAttenuationIndexRange
+{
+    uint16_t minimum;
+    uint16_t maximum;
+};
+
+TxAttenuationIndexRange txAttenuationIndexRange(const skiq_param_t &param,
+                                                const skiq_tx_hdl_t handle)
+{
+    if (handle >= skiq_tx_hdl_end)
+    {
+        throw std::runtime_error("invalid TX handle while reading attenuation range");
+    }
+
+    TxAttenuationIndexRange range{
+        param.tx_param[handle].atten_quarter_db_min,
+        param.tx_param[handle].atten_quarter_db_max
+    };
+
+    if (range.maximum < range.minimum)
+    {
+        throw std::runtime_error("Sidekiq SDK returned an invalid TX attenuation range");
+    }
+
+    return range;
+}
+
+double quarterDbToDb(const uint16_t value)
+{
+    return static_cast<double>(value) * TX_ATTENUATION_STEP_DB;
+}
+
+uint16_t dbToQuarterDb(const double value)
+{
+    return static_cast<uint16_t>(std::llround(value / TX_ATTENUATION_STEP_DB));
+}
+
+bool rangeContains(const SoapySDR::Range &range, const double value)
+{
+    return std::isfinite(value) &&
+           value >= range.minimum() &&
+           value <= range.maximum();
+}
+
+SoapySDR::Range txAttenuationRangeDb(const skiq_param_t &param,
+                                     const skiq_tx_hdl_t handle)
+{
+    const TxAttenuationIndexRange range =
+        txAttenuationIndexRange(param, handle);
+    return SoapySDR::Range(quarterDbToDb(range.minimum),
+                           quarterDbToDb(range.maximum),
+                           TX_ATTENUATION_STEP_DB);
+}
+
+SoapySDR::Range txOutputGainRangeDb(const skiq_param_t &param,
+                                    const skiq_tx_hdl_t handle)
+{
+    const TxAttenuationIndexRange range =
+        txAttenuationIndexRange(param, handle);
+    return SoapySDR::Range(0.0,
+                           quarterDbToDb(range.maximum - range.minimum),
+                           TX_ATTENUATION_STEP_DB);
+}
+
+uint16_t txAttenuationIndexFromOutputGainDb(const skiq_param_t &param,
+                                            const skiq_tx_hdl_t handle,
+                                            const double gain_db)
+{
+    const TxAttenuationIndexRange range =
+        txAttenuationIndexRange(param, handle);
+    const int requested =
+        static_cast<int>(range.maximum) -
+        static_cast<int>(std::llround(gain_db / TX_ATTENUATION_STEP_DB));
+    const int clamped = std::max(static_cast<int>(range.minimum),
+                                 std::min(static_cast<int>(range.maximum),
+                                          requested));
+    return static_cast<uint16_t>(clamped);
+}
+
+uint16_t txAttenuationIndexFromAttenuationDb(const skiq_param_t &param,
+                                             const skiq_tx_hdl_t handle,
+                                             const double attenuation_db)
+{
+    const TxAttenuationIndexRange range =
+        txAttenuationIndexRange(param, handle);
+    const int requested = static_cast<int>(dbToQuarterDb(attenuation_db));
+    const int clamped = std::max(static_cast<int>(range.minimum),
+                                 std::min(static_cast<int>(range.maximum),
+                                          requested));
+    return static_cast<uint16_t>(clamped);
+}
+
+double txOutputGainDbFromAttenuationIndex(const skiq_param_t &param,
+                                          const skiq_tx_hdl_t handle,
+                                          const uint16_t attenuation_index)
+{
+    const TxAttenuationIndexRange range =
+        txAttenuationIndexRange(param, handle);
+    const uint16_t clamped_index =
+        std::max(range.minimum, std::min(range.maximum, attenuation_index));
+    return quarterDbToDb(range.maximum - clamped_index);
+}
+
+double txAttenuationDbFromAttenuationIndex(const skiq_param_t &param,
+                                           const skiq_tx_hdl_t handle,
+                                           const uint16_t attenuation_index)
+{
+    const TxAttenuationIndexRange range =
+        txAttenuationIndexRange(param, handle);
+    const uint16_t clamped_index =
+        std::max(range.minimum, std::min(range.maximum, attenuation_index));
+    return quarterDbToDb(clamped_index);
+}
+
+std::string rfPortName(const skiq_rf_port_t port)
+{
+    switch (port)
+    {
+        case skiq_rf_port_J1: return "J1";
+        case skiq_rf_port_J2: return "J2";
+        case skiq_rf_port_J3: return "J3";
+        case skiq_rf_port_J4: return "J4";
+        case skiq_rf_port_J5: return "J5";
+        case skiq_rf_port_J6: return "J6";
+        case skiq_rf_port_J7: return "J7";
+        case skiq_rf_port_J300: return "J300";
+        case skiq_rf_port_Jxxx_RX1: return "RX1";
+        case skiq_rf_port_Jxxx_TX1RX2: return "TX1RX2";
+        case skiq_rf_port_J8: return "J8";
+        default: return "NONE";
+    }
+}
+
+bool rfPortNameMatches(const std::string &requested,
+                       const skiq_rf_port_t port)
+{
+    if (equalsIgnoreCase(requested, rfPortName(port)))
+    {
+        return true;
+    }
+
+    const char *sdk_name = skiq_rf_port_string(port);
+    return sdk_name != nullptr && equalsIgnoreCase(requested, sdk_name);
+}
+
+void appendRfPortName(std::vector<std::string> &names,
+                      const skiq_rf_port_t port)
+{
+    const std::string name = rfPortName(port);
+    if (name == "NONE")
+    {
+        return;
+    }
+
+    if (std::find(names.begin(), names.end(), name) == names.end())
+    {
+        names.push_back(name);
+    }
+}
+
+bool findPortInList(const skiq_rf_port_t requested,
+                    const skiq_rf_port_t *ports,
+                    const uint8_t count)
+{
+    for (uint8_t index = 0; index < count; index++)
+    {
+        if (ports[index] == requested)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+skiq_rf_port_t findSinglePortByAlias(const std::string &name,
+                                     const skiq_rf_port_t *fixed_ports,
+                                     const uint8_t num_fixed_ports,
+                                     const skiq_rf_port_t *trx_ports,
+                                     const uint8_t num_trx_ports)
+{
+    if (equalsIgnoreCase(name, "TRX"))
+    {
+        return num_trx_ports == 1 ? trx_ports[0] : skiq_rf_port_unknown;
+    }
+
+    if (equalsIgnoreCase(name, "RX") || equalsIgnoreCase(name, "TX"))
+    {
+        return num_fixed_ports == 1 ? fixed_ports[0] : skiq_rf_port_unknown;
+    }
+
+    return skiq_rf_port_unknown;
+}
+
+skiq_rf_port_t rfPortFromAntennaName(const std::string &name,
+                                     const skiq_rf_port_t *fixed_ports,
+                                     const uint8_t num_fixed_ports,
+                                     const skiq_rf_port_t *trx_ports,
+                                     const uint8_t num_trx_ports)
+{
+    for (uint8_t index = 0; index < num_fixed_ports; index++)
+    {
+        if (rfPortNameMatches(name, fixed_ports[index]))
+        {
+            return fixed_ports[index];
+        }
+    }
+
+    for (uint8_t index = 0; index < num_trx_ports; index++)
+    {
+        if (rfPortNameMatches(name, trx_ports[index]))
+        {
+            return trx_ports[index];
+        }
+    }
+
+    return findSinglePortByAlias(name,
+                                 fixed_ports,
+                                 num_fixed_ports,
+                                 trx_ports,
+                                 num_trx_ports);
+}
+
+std::string hzString(const double value)
+{
+    std::ostringstream stream;
+    stream << value;
+    return stream.str();
+}
+
+std::string rangeString(const SoapySDR::Range &range)
+{
+    return "[" + hzString(range.minimum()) + ", " +
+           hzString(range.maximum()) + "] Hz";
+}
+
+void requirePositiveHz(const std::string &what, const double value)
+{
+    if (!std::isfinite(value) || value <= 0.0)
+    {
+        throw std::runtime_error(what + " must be a positive value in Hz");
+    }
+}
+
+uint32_t hzToUint32(const std::string &what, const double value)
+{
+    requirePositiveHz(what, value);
+    if (value > static_cast<double>(std::numeric_limits<uint32_t>::max()))
+    {
+        throw std::runtime_error(what + " is too large for the Sidekiq API: " +
+                                 hzString(value));
+    }
+    return static_cast<uint32_t>(value);
+}
+
+uint64_t hzToUint64(const std::string &what, const double value)
+{
+    requirePositiveHz(what, value);
+    if (value > static_cast<double>(std::numeric_limits<uint64_t>::max()))
+    {
+        throw std::runtime_error(what + " is too large for the Sidekiq API: " +
+                                 hzString(value));
+    }
+    return static_cast<uint64_t>(value);
+}
+
+SoapySDR::Range fallbackSampleRateRange(const uint8_t card)
+{
+    uint32_t min_sample_rate = 0;
+    uint32_t max_sample_rate = 0;
+
+    int status = skiq_read_min_sample_rate(card, &min_sample_rate);
+    if (status != 0)
+    {
+        SoapySDR_logf(SOAPY_SDR_ERROR,
+                      "skiq_read_min_sample_rate failed, (card %u), status %d",
+                      card, status);
+        throw std::runtime_error("");
+    }
+
+    status = skiq_read_max_sample_rate(card, &max_sample_rate);
+    if (status != 0)
+    {
+        SoapySDR_logf(SOAPY_SDR_ERROR,
+                      "skiq_read_max_sample_rate failed, (card %u), status %d",
+                      card, status);
+        throw std::runtime_error("");
+    }
+
+    return SoapySDR::Range(min_sample_rate, max_sample_rate);
+}
+
+SoapySDR::Range sampleRateRangeFromValues(const uint8_t card,
+                                          const uint32_t min_sample_rate,
+                                          const uint32_t max_sample_rate)
+{
+    if (min_sample_rate != 0 && max_sample_rate >= min_sample_rate)
+    {
+        return SoapySDR::Range(min_sample_rate, max_sample_rate);
+    }
+
+    return fallbackSampleRateRange(card);
+}
+
+SoapySDR::Range rxSampleRateRangeForHandle(const uint8_t card,
+                                           const skiq_param_t &param,
+                                           const skiq_rx_hdl_t handle)
+{
+    if (handle >= skiq_rx_hdl_end)
+    {
+        throw std::runtime_error("invalid RX handle while reading sample-rate range");
+    }
+
+    const skiq_rx_param_t &rx_param = param.rx_param[handle];
+    return sampleRateRangeFromValues(card,
+                                     rx_param.sample_rate_min,
+                                     rx_param.sample_rate_max);
+}
+
+SoapySDR::Range txSampleRateRangeForHandle(const uint8_t card,
+                                           const skiq_param_t &param,
+                                           const skiq_tx_hdl_t handle)
+{
+    if (handle >= skiq_tx_hdl_end)
+    {
+        throw std::runtime_error("invalid TX handle while reading sample-rate range");
+    }
+
+    const skiq_tx_param_t &tx_param = param.tx_param[handle];
+    return sampleRateRangeFromValues(card,
+                                     tx_param.sample_rate_min,
+                                     tx_param.sample_rate_max);
+}
+
+SoapySDR::Range intersectSampleRateRanges(const uint8_t card,
+                                          const skiq_param_t &param,
+                                          const std::vector<skiq_rx_hdl_t> &handles)
+{
+    if (handles.empty())
+    {
+        throw std::runtime_error("cannot compute RX sample-rate range without handles");
+    }
+
+    SoapySDR::Range intersection =
+        rxSampleRateRangeForHandle(card, param, handles.front());
+
+    for (size_t index = 1; index < handles.size(); index++)
+    {
+        const SoapySDR::Range next =
+            rxSampleRateRangeForHandle(card, param, handles[index]);
+        const double minimum = std::max(intersection.minimum(), next.minimum());
+        const double maximum = std::min(intersection.maximum(), next.maximum());
+        if (minimum > maximum)
+        {
+            throw std::runtime_error(
+                "selected RX handles do not share a common sample-rate range");
+        }
+        intersection = SoapySDR::Range(minimum, maximum);
+    }
+
+    return intersection;
+}
+
+void validateRangeValue(const std::string &what,
+                        const double value,
+                        const SoapySDR::Range &range)
+{
+    if (value < range.minimum() || value > range.maximum())
+    {
+        throw std::runtime_error(what + " " + hzString(value) +
+                                 " Hz is outside the supported range " +
+                                 rangeString(range));
+    }
+}
+
+std::vector<double> steppedValuesForRanges(const SoapySDR::RangeList &ranges,
+                                           const double step)
+{
+    std::vector<double> results;
+
+    for (const auto &range : ranges)
+    {
+        for (double value = range.minimum(); value <= range.maximum();
+             value += step)
+        {
+            results.push_back(value);
+        }
+
+        if (results.empty() || results.back() != range.maximum())
+        {
+            results.push_back(range.maximum());
+        }
+    }
+
+    return results;
+}
+
+uint32_t rxHandleMask(const skiq_rx_hdl_t handle)
+{
+    return handle < 32 ? (1u << static_cast<unsigned>(handle)) : 0;
+}
+
+uint32_t txHandleMask(const skiq_tx_hdl_t handle)
+{
+    return handle < 32 ? (1u << static_cast<unsigned>(handle)) : 0;
+}
+
+constexpr uint32_t RX_A1 = (1u << skiq_rx_hdl_A1);
+constexpr uint32_t RX_A2 = (1u << skiq_rx_hdl_A2);
+constexpr uint32_t RX_B1 = (1u << skiq_rx_hdl_B1);
+constexpr uint32_t RX_B2 = (1u << skiq_rx_hdl_B2);
+constexpr uint32_t RX_C1 = (1u << skiq_rx_hdl_C1);
+constexpr uint32_t RX_D1 = (1u << skiq_rx_hdl_D1);
+constexpr uint32_t RX_ALL_X2 = RX_A1 | RX_A2 | RX_B1;
+constexpr uint32_t RX_ALL_X4 = RX_A1 | RX_A2 | RX_B1 | RX_B2 | RX_C1 | RX_D1;
+constexpr uint32_t RX_ALL_NV100 = RX_A1 | RX_A2 | RX_B1 | RX_B2;
+
+constexpr uint32_t TX_A1 = (1u << skiq_tx_hdl_A1);
+constexpr uint32_t TX_A2 = (1u << skiq_tx_hdl_A2);
+constexpr uint32_t TX_B1 = (1u << skiq_tx_hdl_B1);
+constexpr uint32_t TX_B2 = (1u << skiq_tx_hdl_B2);
+constexpr uint32_t TX_ALL_X2 = TX_A1 | TX_A2;
+constexpr uint32_t TX_ALL_X4 = TX_A1 | TX_A2 | TX_B1 | TX_B2;
+constexpr uint32_t TX_ALL_NV100 = TX_A1 | TX_A2 | TX_B1 | TX_B2;
+
+struct ProfileEntry
+{
+    uint32_t rate;
+    uint32_t handle_mask;
+    uint8_t bandwidth_count;
+    uint32_t bandwidths[4];
+};
+
+constexpr ProfileEntry profile(const uint32_t rate,
+                               const uint32_t handle_mask,
+                               const uint32_t bw0,
+                               const uint32_t bw1 = 0,
+                               const uint32_t bw2 = 0,
+                               const uint32_t bw3 = 0)
+{
+    return ProfileEntry{
+        rate,
+        handle_mask,
+        static_cast<uint8_t>((bw0 != 0) + (bw1 != 0) + (bw2 != 0) + (bw3 != 0)),
+        {bw0, bw1, bw2, bw3}
+    };
+}
+
+bool libsidekiqAtLeast(const uint8_t major,
+                       const uint8_t minor,
+                       const uint8_t patch)
+{
+    uint8_t actual_major = LIBSIDEKIQ_VERSION_MAJOR;
+    uint8_t actual_minor = LIBSIDEKIQ_VERSION_MINOR;
+    uint8_t actual_patch = LIBSIDEKIQ_VERSION_PATCH;
+    const char *label = nullptr;
+
+    const int status = skiq_read_libsidekiq_version(&actual_major,
+                                                    &actual_minor,
+                                                    &actual_patch,
+                                                    &label);
+    if (status != 0)
+    {
+        SoapySDR_logf(SOAPY_SDR_WARNING,
+                      "skiq_read_libsidekiq_version failed, status %d; "
+                      "using compile-time libsidekiq version",
+                      status);
+    }
+
+    if (actual_major != major) return actual_major > major;
+    if (actual_minor != minor) return actual_minor > minor;
+    return actual_patch >= patch;
+}
+
+std::vector<ProfileEntry> nv100Profiles(const bool include_v424_rates,
+                                        const uint32_t handle_mask)
+{
+    std::vector<ProfileEntry> profiles = {
+        profile(250000, handle_mask, 0),
+        profile(541667, handle_mask, 0),
+        profile(740740, handle_mask, 0),
+        profile(750000, handle_mask, 0),
+        profile(1000000, handle_mask, 0),
+        profile(1920000, handle_mask, 0),
+        profile(2457600, handle_mask, 0),
+        profile(2500000, handle_mask, 0),
+        profile(2800000, handle_mask, 0),
+        profile(3840000, handle_mask, 0),
+        profile(4000000, handle_mask, 0),
+        profile(4915200, handle_mask, 0),
+        profile(5000000, handle_mask, 0),
+        profile(5600000, handle_mask, 0),
+        profile(7680000, handle_mask, 0),
+        profile(9830400, handle_mask, 0),
+        profile(10000000, handle_mask, 0),
+        profile(11200000, handle_mask, 0),
+        profile(15360000, handle_mask, 0),
+        profile(16000000, handle_mask, 0),
+        profile(20000000, handle_mask, 0),
+        profile(21666700, handle_mask, 0),
+        profile(22000000, handle_mask, 0),
+        profile(23040000, handle_mask, 0),
+        profile(30720000, handle_mask, 0),
+        profile(40000000, handle_mask, 0),
+        profile(61440000, handle_mask, 0)
+    };
+
+    if (include_v424_rates)
+    {
+        profiles.push_back(profile(160000, handle_mask, 0));
+        profiles.push_back(profile(270270, handle_mask, 0));
+        profiles.push_back(profile(307200, handle_mask, 0));
+        profiles.push_back(profile(640000, handle_mask, 0));
+        profiles.push_back(profile(50000000, handle_mask, 0));
+        profiles.push_back(profile(60000000, handle_mask, 0));
+    }
+
+    return profiles;
+}
+
+std::vector<ProfileEntry> rxProfilesForPart(const skiq_part_t part)
+{
+    switch (part)
+    {
+        case skiq_x2:
+            return {
+                profile(245760000, RX_B1, 200000000, 100000000),
+                profile(153600000, RX_ALL_X2, 100000000),
+                profile(122880000, RX_ALL_X2, 100000000),
+                profile(100000000, RX_ALL_X2, 82000000),
+                profile(73728000, RX_ALL_X2, 60456000, 30228000),
+                profile(61440000, RX_ALL_X2, 50000000, 25000000),
+                profile(50000000, RX_ALL_X2, 41000000),
+                profile(36864000, RX_A1 | RX_A2, 30228000),
+                profile(30720000, RX_A1 | RX_A2, 25000000, 20000000, 18000000)
+            };
+
+        case skiq_x4:
+        case skiq_x40:
+            return {
+                profile(500000000, RX_C1 | RX_D1, 450000000, 400000000),
+                profile(491520000, RX_C1 | RX_D1, 450000000, 400000000),
+                profile(250000000, RX_ALL_X4, 200000000, 100000000),
+                profile(245760000, RX_ALL_X4, 200000000, 100000000),
+                profile(200000000, RX_ALL_X4, 164000000),
+                profile(153600000, RX_ALL_X4, 100000000),
+                profile(122880000, RX_ALL_X4, 100000000, 72000000, 64000000, 61440000),
+                profile(100000000, RX_ALL_X4, 82000000),
+                profile(76800000, RX_ALL_X4, 30720000),
+                profile(73728000, RX_ALL_X4, 60456000, 30228000),
+                profile(61440000, RX_ALL_X4, 50000000, 25000000),
+                profile(50000000, RX_ALL_X4, 41000000, 20000000)
+            };
+
+        case skiq_nv100:
+        case skiq_nvm2:
+            return nv100Profiles(libsidekiqAtLeast(4, 24, 0), RX_ALL_NV100);
+
+        default:
+            return {};
+    }
+}
+
+std::vector<ProfileEntry> txProfilesForPart(const skiq_part_t part)
+{
+    switch (part)
+    {
+        case skiq_x2:
+            return {
+                profile(153600000, TX_ALL_X2, 100000000),
+                profile(122880000, TX_ALL_X2, 100000000),
+                profile(100000000, TX_ALL_X2, 82000000),
+                profile(73728000, TX_ALL_X2, 60456000),
+                profile(61440000, TX_ALL_X2, 50000000),
+                profile(50000000, TX_ALL_X2, 41000000)
+            };
+
+        case skiq_x4:
+            return {
+                profile(500000000, TX_ALL_X4, 450000000, 400000000),
+                profile(491520000, TX_ALL_X4, 450000000, 400000000),
+                profile(250000000, TX_ALL_X4, 200000000, 100000000),
+                profile(245760000, TX_ALL_X4, 200000000, 100000000),
+                profile(200000000, TX_ALL_X4, 164000000),
+                profile(153600000, TX_ALL_X4, 100000000),
+                profile(122880000, TX_ALL_X4, 100000000, 72000000, 64000000, 61440000),
+                profile(100000000, TX_ALL_X4, 82000000),
+                profile(76800000, TX_ALL_X4, 30720000),
+                profile(73728000, TX_ALL_X4, 60456000, 30228000),
+                profile(61440000, TX_ALL_X4, 50000000, 25000000),
+                profile(50000000, TX_ALL_X4, 41000000, 20000000)
+            };
+
+        case skiq_x40:
+            return {
+                profile(500000000, TX_A1 | TX_B1, 450000000, 400000000),
+                profile(491520000, TX_A1 | TX_B1, 450000000, 400000000),
+                profile(250000000, TX_A1 | TX_B1, 200000000, 100000000),
+                profile(245760000, TX_A1 | TX_B1, 200000000, 100000000),
+                profile(200000000, TX_A1 | TX_B1, 164000000),
+                profile(153600000, TX_A1 | TX_B1, 100000000),
+                profile(122880000, TX_A1 | TX_B1, 100000000, 72000000, 64000000, 61440000),
+                profile(100000000, TX_A1 | TX_B1, 82000000),
+                profile(76800000, TX_A1 | TX_B1, 30720000),
+                profile(73728000, TX_A1 | TX_B1, 60456000, 30228000),
+                profile(61440000, TX_A1 | TX_B1, 50000000, 25000000),
+                profile(50000000, TX_A1 | TX_B1, 41000000, 20000000)
+            };
+
+        case skiq_nv100:
+        case skiq_nvm2:
+            return nv100Profiles(libsidekiqAtLeast(4, 24, 0), TX_ALL_NV100);
+
+        default:
+            return {};
+    }
+}
+
+bool appendUniqueDouble(std::vector<double> &values, const double value)
+{
+    if (std::find(values.begin(), values.end(), value) != values.end())
+    {
+        return false;
+    }
+
+    values.push_back(value);
+    return true;
+}
+
+std::vector<double> sampleRatesFromProfiles(const std::vector<ProfileEntry> &profiles,
+                                            const uint32_t handle_mask)
+{
+    std::vector<double> values;
+    for (const auto &entry : profiles)
+    {
+        if ((entry.handle_mask & handle_mask) != 0)
+        {
+            appendUniqueDouble(values, entry.rate);
+        }
+    }
+
+    std::sort(values.begin(), values.end());
+    return values;
+}
+
+std::vector<double> filterValuesInRange(const std::vector<double> &values,
+                                        const SoapySDR::Range &range)
+{
+    std::vector<double> filtered;
+    for (const double value : values)
+    {
+        if (value >= range.minimum() && value <= range.maximum())
+        {
+            appendUniqueDouble(filtered, value);
+        }
+    }
+
+    std::sort(filtered.begin(), filtered.end());
+    return filtered;
+}
+
+bool rateMatchesProfile(const std::vector<double> &rates, const uint32_t rate)
+{
+    for (const double profile_rate : rates)
+    {
+        if (std::abs(profile_rate - static_cast<double>(rate)) <= 100.0)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+std::vector<double> rxProfileSampleRates(const skiq_part_t part,
+                                         const uint8_t card,
+                                         const skiq_param_t &param,
+                                         const skiq_rx_hdl_t handle)
+{
+    return filterValuesInRange(
+        sampleRatesFromProfiles(rxProfilesForPart(part), rxHandleMask(handle)),
+        rxSampleRateRangeForHandle(card, param, handle));
+}
+
+std::vector<double> txProfileSampleRates(const skiq_part_t part,
+                                         const uint8_t card,
+                                         const skiq_param_t &param,
+                                         const skiq_tx_hdl_t handle)
+{
+    return filterValuesInRange(
+        sampleRatesFromProfiles(txProfilesForPart(part), txHandleMask(handle)),
+        txSampleRateRangeForHandle(card, param, handle));
+}
+
+std::vector<double> bandwidthsFromProfilesForRate(
+        const std::vector<ProfileEntry> &profiles,
+        const uint32_t handle_mask,
+        const uint32_t sample_rate)
+{
+    std::vector<double> values;
+    for (const auto &entry : profiles)
+    {
+        if ((entry.handle_mask & handle_mask) == 0)
+        {
+            continue;
+        }
+
+        if (std::abs(static_cast<double>(entry.rate) -
+                     static_cast<double>(sample_rate)) > 100.0)
+        {
+            continue;
+        }
+
+        for (uint8_t index = 0; index < entry.bandwidth_count; index++)
+        {
+            appendUniqueDouble(values, entry.bandwidths[index]);
+        }
+    }
+
+    std::sort(values.begin(), values.end());
+    return values;
+}
+
+bool partRequiresExactBuiltInSampleRate(const skiq_part_t part)
+{
+    return part == skiq_nv100 || part == skiq_nvm2;
+}
+
+void validateBuiltInSampleRateIfRequired(const std::string &what,
+                                         const skiq_part_t part,
+                                         const uint32_t rate,
+                                         const std::vector<double> &rates)
+{
+    if (!partRequiresExactBuiltInSampleRate(part) || rates.empty())
+    {
+        return;
+    }
+
+    if (rateMatchesProfile(rates, rate))
+    {
+        return;
+    }
+
+    std::ostringstream stream;
+    stream << what << " " << rate
+           << " Hz is not one of the documented built-in profile rates for "
+           << skiq_part_string(part) << ". Use listSampleRates() to query "
+           << "the suggested rates for this card.";
+    throw std::runtime_error(stream.str());
+}
+
+std::vector<double> nv100BandwidthsForRate(const uint32_t rate)
+{
+    std::vector<double> values;
+
+    appendUniqueDouble(values, rate * 0.03);
+    for (double percent = 5.0; percent <= 80.0; percent += 0.5)
+    {
+        appendUniqueDouble(values, rate * (percent / 100.0));
+    }
+
+    appendUniqueDouble(values, rate * 0.86);
+    appendUniqueDouble(values, rate * 0.89);
+    appendUniqueDouble(values, rate * 0.95);
+    appendUniqueDouble(values, rate * 0.96);
+    appendUniqueDouble(values, rate * 0.99);
+    std::sort(values.begin(), values.end());
+    return values;
+}
+
+void validateBandwidthAgainstSampleRate(const std::string &what,
+                                        const uint32_t bandwidth,
+                                        const uint32_t sample_rate)
+{
+    if (bandwidth == 0)
+    {
+        throw std::runtime_error(what + " must be a positive value in Hz");
+    }
+
+    if (sample_rate != 0 && bandwidth > sample_rate)
+    {
+        throw std::runtime_error(what + " " + std::to_string(bandwidth) +
+                                 " Hz exceeds the current sample rate " +
+                                 std::to_string(sample_rate) + " Hz");
+    }
+}
+}
+
+size_t SoapySidekiq::mappedRxChannel(const size_t channel) const
+{
+    if (!rx_channel_alias_enabled)
+    {
+        return channel;
+    }
+
+    if (channel != DEFAULT_CHANNEL)
+    {
+        throw std::runtime_error("RX channel " + std::to_string(channel) +
+                                 " is not available when using the channel alias");
+    }
+
+    return rx_channel_alias;
+}
+
+skiq_rx_hdl_t SoapySidekiq::rxHandleForChannel(const size_t channel) const
+{
+    const size_t mapped_channel = mappedRxChannel(channel);
+
+    if (this->param.rf_param.num_rx_channels > 0)
+    {
+        if (mapped_channel >= this->param.rf_param.num_rx_channels)
+        {
+            throw std::runtime_error("RX channel " + std::to_string(channel) +
+                                     " is not available on this Sidekiq card");
+        }
+
+        const skiq_rx_hdl_t hdl = this->param.rf_param.rx_handles[mapped_channel];
+        if (hdl >= skiq_rx_hdl_end)
+        {
+            throw std::runtime_error("RX channel " + std::to_string(channel) +
+                                     " maps to an invalid Sidekiq handle");
+        }
+        return hdl;
+    }
+
+    if (mapped_channel >= skiq_rx_hdl_end)
+    {
+        throw std::runtime_error("RX channel " + std::to_string(channel) +
+                                 " is not a valid Sidekiq handle");
+    }
+    return static_cast<skiq_rx_hdl_t>(mapped_channel);
+}
+
+skiq_tx_hdl_t SoapySidekiq::txHandleForChannel(const size_t channel) const
+{
+    if (this->param.rf_param.num_tx_channels > 0)
+    {
+        if (channel >= this->param.rf_param.num_tx_channels)
+        {
+            throw std::runtime_error("TX channel " + std::to_string(channel) +
+                                     " is not available on this Sidekiq card");
+        }
+
+        const skiq_tx_hdl_t hdl = this->param.rf_param.tx_handles[channel];
+        if (hdl >= skiq_tx_hdl_end)
+        {
+            throw std::runtime_error("TX channel " + std::to_string(channel) +
+                                     " maps to an invalid Sidekiq handle");
+        }
+        return hdl;
+    }
+
+    if (channel >= skiq_tx_hdl_end)
+    {
+        throw std::runtime_error("TX channel " + std::to_string(channel) +
+                                 " is not a valid Sidekiq handle");
+    }
+    return static_cast<skiq_tx_hdl_t>(channel);
+}
+
+void SoapySidekiq::acquireSidekiqCard(const uint8_t requested_card,
+                                      const skiq_xport_init_level_t level)
+{
+    int status = 0;
+
+    if (requested_card >= SKIQ_MAX_NUM_CARDS)
+    {
+        SoapySDR_logf(SOAPY_SDR_ERROR, "Requested card %u is out of range",
+                      requested_card);
+        throw std::runtime_error("Requested Sidekiq card is out of range");
+    }
+
+    std::lock_guard<std::mutex> lock(sidekiq_init_mutex);
+
+    if (!sidekiq_library_initialized)
+    {
+        status = skiq_init_without_cards();
+        if (status != 0)
+        {
+            SoapySDR_logf(SOAPY_SDR_ERROR,
+                          "skiq_init_without_cards failed, status %d",
+                          status);
+            throw std::runtime_error("skiq_init_without_cards failed");
+        }
+        sidekiq_library_initialized = true;
+    }
+
+    if (sidekiq_card_ref_count[requested_card] == 0)
+    {
+        const uint8_t cards[] = {requested_card};
+        status = skiq_enable_cards(cards, 1, level);
+        if (status != 0)
+        {
+            SoapySDR_logf(SOAPY_SDR_ERROR,
+                          "skiq_enable_cards failed (card %u), status %d",
+                          requested_card, status);
+
+            if (sidekiq_instance_count == 0)
+            {
+                const int exit_status = skiq_exit();
+                if (exit_status != 0)
+                {
+                    SoapySDR_logf(SOAPY_SDR_WARNING,
+                                  "skiq_exit failed after enable-card failure, status %d",
+                                  exit_status);
+                }
+                sidekiq_library_initialized = false;
+            }
+
+            throw std::runtime_error("skiq_enable_cards failed");
+        }
+    }
+
+    sidekiq_card_ref_count[requested_card]++;
+    sidekiq_instance_count++;
+}
+
+void SoapySidekiq::releaseSidekiqCard(const uint8_t released_card)
+{
+    std::lock_guard<std::mutex> lock(sidekiq_init_mutex);
+
+    if (!sidekiq_library_initialized)
+    {
+        return;
+    }
+
+    if (released_card < SKIQ_MAX_NUM_CARDS &&
+        sidekiq_card_ref_count[released_card] > 0)
+    {
+        sidekiq_card_ref_count[released_card]--;
+        if (sidekiq_card_ref_count[released_card] == 0)
+        {
+            const uint8_t cards[] = {released_card};
+            const int status = skiq_disable_cards(cards, 1);
+            if (status != 0)
+            {
+                SoapySDR_logf(SOAPY_SDR_WARNING,
+                              "skiq_disable_cards failed (card %u), status %d",
+                              released_card, status);
+            }
+        }
+    }
+    else
+    {
+        SoapySDR_logf(SOAPY_SDR_WARNING,
+                      "release requested for untracked Sidekiq card %u",
+                      released_card);
+    }
+
+    if (sidekiq_instance_count > 0)
+    {
+        sidekiq_instance_count--;
+    }
+    else
+    {
+        SoapySDR_logf(SOAPY_SDR_WARNING,
+                      "Sidekiq instance release requested with zero references");
+    }
+
+    if (sidekiq_instance_count == 0)
+    {
+        const int status = skiq_exit();
+        if (status != 0)
+        {
+            SoapySDR_logf(SOAPY_SDR_WARNING,
+                          "skiq_exit failed, status %d", status);
+        }
+        sidekiq_library_initialized = false;
+    }
 }
 
 // Constructor
@@ -154,6 +1287,8 @@ SoapySidekiq::SoapySidekiq(const SoapySDR::Kwargs &args)
     complete_count = 0;
 
     rx_running = false;
+    rx_channel_alias_enabled = false;
+    rx_channel_alias = DEFAULT_CHANNEL;
 
     if (args.count("card") != 0)
     {
@@ -173,6 +1308,28 @@ SoapySidekiq::SoapySidekiq(const SoapySDR::Kwargs &args)
         throw std::runtime_error("");
     }
 
+    const auto channel_arg = args.count("rx_channel") != 0
+        ? args.find("rx_channel")
+        : (args.count("channel") != 0 ? args.find("channel") : args.end());
+    if (channel_arg != args.end())
+    {
+        try
+        {
+            rx_channel_alias = std::stoul(channel_arg->second);
+            rx_channel_alias_enabled = true;
+        }
+        catch (const std::invalid_argument &)
+        {
+            SoapySDR_logf(SOAPY_SDR_ERROR, "Requested RX channel is invalid");
+            throw std::runtime_error("");
+        }
+        catch (const std::out_of_range &)
+        {
+            SoapySDR_logf(SOAPY_SDR_ERROR, "Requested RX channel is out of range");
+            throw std::runtime_error("");
+        }
+    }
+
     if (args.count("tx_block_size") != 0)
     {
         current_tx_block_size = std::stoi(args.at("tx_block_size"));
@@ -183,33 +1340,43 @@ SoapySidekiq::SoapySidekiq(const SoapySDR::Kwargs &args)
     }
     SoapySDR_logf(SOAPY_SDR_INFO, "TX block size set to %u", current_tx_block_size);
 
-    /* set the source to what is passed in */
-    if (args.count("clock_source") > 0) 
-    {
-        setClockSource(args.at("clock_source"));
-    }
-
-    if (args.count("time_source") > 0) 
-    {
-        setTimeSource(args.at("time_source"));
-    }
-
-
     rx_hdl = skiq_rx_hdl_A1;
     tx_hdl = skiq_tx_hdl_A1;
 
-    skiq_xport_type_t type  = skiq_xport_type_auto;
     skiq_xport_init_level_t level = skiq_xport_init_level_full;
 
     SoapySDR_logf(SOAPY_SDR_INFO, "Sidekiq opening card %u", card);
 
-    /* init sidekiq */
-    status = skiq_init(type, level, &card, 1);
-    if (status != 0)
+    acquireSidekiqCard(card, level);
+    sidekiq_card_acquired = true;
+
+    struct CardReleaseGuard
     {
-        SoapySDR_logf(SOAPY_SDR_ERROR, "skiq_init failed (card %u), status %d",
+        SoapySidekiq *device;
+        bool active;
+
+        ~CardReleaseGuard()
+        {
+            if (active)
+            {
+                device->releaseSidekiqCard(device->card);
+                device->sidekiq_card_acquired = false;
+            }
+        }
+    } card_release_guard{this, true};
+
+    char *serial_str = nullptr;
+    status = skiq_read_serial_string(card, &serial_str);
+    if (status == 0 && serial_str != nullptr)
+    {
+        serial = serial_str;
+    }
+    else
+    {
+        SoapySDR_logf(SOAPY_SDR_WARNING,
+                      "skiq_read_serial_string failed, card %u, status %d",
                       card, status);
-        throw std::runtime_error("");
+        serial = "";
     }
 
     status = skiq_write_chan_mode(card, skiq_chan_mode_single);
@@ -225,21 +1392,17 @@ SoapySidekiq::SoapySidekiq(const SoapySDR::Kwargs &args)
     this->rx_sample_rate = DEFAULT_SAMPLE_RATE;
     this->tx_sample_rate = DEFAULT_SAMPLE_RATE;
 
-    setSampleRate(SOAPY_SDR_RX, DEFAULT_CHANNEL, static_cast<uint32_t>(this->rx_sample_rate));
-    setSampleRate(SOAPY_SDR_TX, DEFAULT_CHANNEL, static_cast<uint32_t>(this->tx_sample_rate));
-
     this->rx_bandwidth = DEFAULT_BANDWIDTH;
     this->tx_bandwidth = DEFAULT_BANDWIDTH;
 
-    setBandwidth(SOAPY_SDR_RX, DEFAULT_CHANNEL, static_cast<uint32_t>(this->rx_bandwidth));
-    setBandwidth(SOAPY_SDR_TX, DEFAULT_CHANNEL, static_cast<uint32_t>(this->tx_bandwidth));
-
     /* set default frequency */
     this->rx_center_frequency = DEFAULT_FREQUENCY;
-    setFrequency(SOAPY_SDR_RX, DEFAULT_CHANNEL, static_cast<uint64_t>(this->rx_center_frequency)); 
+    for (int h = 0; h < skiq_rx_hdl_end; h++)
+    {
+        this->rx_center_frequency_by_handle[h] = DEFAULT_FREQUENCY;
+    }
 
     this->tx_center_frequency = DEFAULT_FREQUENCY;
-    setFrequency(SOAPY_SDR_TX, DEFAULT_CHANNEL, static_cast<uint64_t>(this->rx_center_frequency)); 
 
     if (args.count("clock_source") > 0) 
     {
@@ -262,6 +1425,19 @@ SoapySidekiq::SoapySidekiq(const SoapySDR::Kwargs &args)
 
     part = param.card_param.part_type;
     part_str = skiq_part_string(part);
+
+    if (partRequiresExactBuiltInSampleRate(part) &&
+        rx_sample_rate == DEFAULT_SAMPLE_RATE &&
+        tx_sample_rate == DEFAULT_SAMPLE_RATE &&
+        rx_bandwidth == DEFAULT_BANDWIDTH &&
+        tx_bandwidth == DEFAULT_BANDWIDTH)
+    {
+        rx_bandwidth = static_cast<uint32_t>(DEFAULT_SAMPLE_RATE * 0.80);
+        tx_bandwidth = rx_bandwidth;
+        SoapySDR_logf(SOAPY_SDR_INFO,
+                      "using NV100/NVM2-safe default bandwidth %u Hz",
+                      rx_bandwidth);
+    }
 
     SoapySDR_logf(SOAPY_SDR_INFO, "card: %u, part type is %s", card, part_str.c_str());
 
@@ -294,6 +1470,21 @@ SoapySidekiq::SoapySidekiq(const SoapySDR::Kwargs &args)
     }
     num_rx_channels = channels;
 
+    if (rx_channel_alias_enabled)
+    {
+        if (rx_channel_alias >= num_rx_channels)
+        {
+            throw std::runtime_error("Requested RX channel " +
+                                     std::to_string(rx_channel_alias) +
+                                     " is not available on this Sidekiq card");
+        }
+
+        const skiq_rx_hdl_t alias_handle = rxHandleForChannel(DEFAULT_CHANNEL);
+        SoapySDR_logf(SOAPY_SDR_INFO,
+                      "RX channel alias enabled: application channel 0 maps to Sidekiq RX channel %zu (%s)",
+                      rx_channel_alias, rxHandleName(alias_handle));
+    }
+
     status = skiq_read_num_tx_chans(card, &channels);
     if (status != 0)
     {
@@ -302,6 +1493,21 @@ SoapySidekiq::SoapySidekiq(const SoapySDR::Kwargs &args)
         throw std::runtime_error("");
     }
     num_tx_channels = channels;
+
+    if (num_rx_channels > 0)
+    {
+        setFrequency(SOAPY_SDR_RX,
+                     DEFAULT_CHANNEL,
+                     static_cast<double>(this->rx_center_frequency));
+    }
+
+    if (num_tx_channels > 0)
+    {
+        setFrequency(SOAPY_SDR_TX,
+                     DEFAULT_CHANNEL,
+                     static_cast<double>(this->tx_center_frequency));
+    }
+
     uint8_t tmp_resolution = 0;
 
     /* Every card can have a different iq resolution.  */
@@ -361,6 +1567,8 @@ SoapySidekiq::SoapySidekiq(const SoapySDR::Kwargs &args)
     pthread_mutex_init(&tx_enabled_mutex, nullptr);
     pthread_cond_init(&tx_enabled_cond, nullptr);
 
+    card_release_guard.active = false;
+
     SoapySDR_logf(SOAPY_SDR_TRACE, "leaving constructor", card);
 }
 
@@ -375,7 +1583,11 @@ SoapySidekiq::~SoapySidekiq(void)
         p_tx_status = NULL;
     }
 
-    skiq_exit();
+    if (sidekiq_card_acquired)
+    {
+        releaseSidekiqCard(card);
+        sidekiq_card_acquired = false;
+    }
 }
 
 /*******************************************************************
@@ -406,8 +1618,12 @@ SoapySDR::Kwargs SoapySidekiq::getHardwareInfo(void) const
     args["card_type"] = part_str;
     args["card"]   = std::to_string(card);
     args["serial"]   = serial;
-    args["rx_channels"]   = std::to_string(num_rx_channels);
+    args["rx_channels"] = std::to_string(getNumChannels(SOAPY_SDR_RX));
     args["tx_channels"]   = std::to_string(num_tx_channels);
+    if (rx_channel_alias_enabled)
+    {
+        args["sidekiq_rx_channel"] = std::to_string(rx_channel_alias);
+    }
 
     return args;
 }
@@ -422,6 +1638,10 @@ size_t SoapySidekiq::getNumChannels(const int dir) const
 
     if (dir == SOAPY_SDR_RX)
     {
+        if (rx_channel_alias_enabled)
+        {
+            return 1;
+        }
         return num_rx_channels;
     }
     else if (dir == SOAPY_SDR_TX)
@@ -437,64 +1657,444 @@ size_t SoapySidekiq::getNumChannels(const int dir) const
     return -1;
 }
 
+SoapySDR::Kwargs SoapySidekiq::getChannelInfo(const int direction,
+                                              const size_t channel) const
+{
+    SoapySDR::Kwargs info;
+
+    SoapySDR_logf(SOAPY_SDR_TRACE, "getChannelInfo");
+
+    info["card"] = std::to_string(card);
+    info["serial"] = serial;
+    info["card_type"] = part_str;
+
+    if (direction == SOAPY_SDR_RX)
+    {
+        const size_t mapped_channel = mappedRxChannel(channel);
+        const skiq_rx_hdl_t handle = rxHandleForChannel(channel);
+        info["label"] = "RX " + std::string(rxHandleName(handle));
+        info["sidekiq_handle"] = rxHandleName(handle);
+        info["sidekiq_handle_id"] = std::to_string(static_cast<int>(handle));
+        info["sidekiq_channel"] = std::to_string(mapped_channel);
+        info["rf_chain"] = rxHandleMayShareLo(handle) ? "secondary" : "primary";
+    }
+    else if (direction == SOAPY_SDR_TX)
+    {
+        const skiq_tx_hdl_t handle = txHandleForChannel(channel);
+        info["label"] = "TX " + std::string(txHandleName(handle));
+        info["sidekiq_handle"] = txHandleName(handle);
+        info["sidekiq_handle_id"] = std::to_string(static_cast<int>(handle));
+    }
+    else
+    {
+        SoapySDR_logf(SOAPY_SDR_ERROR, "invalid direction %d", direction);
+        throw std::runtime_error("");
+    }
+
+    return info;
+}
+
 /*******************************************************************
  * Antenna API
  ******************************************************************/
 
 std::vector<std::string> SoapySidekiq::listAntennas(const int direction, const size_t channel) const {
     std::vector<std::string> antennas;
+    int status = 0;
+    uint8_t num_fixed_ports = 0;
+    uint8_t num_trx_ports = 0;
+    skiq_rf_port_t fixed_ports[skiq_rf_port_max] = {};
+    skiq_rf_port_t trx_ports[skiq_rf_port_max] = {};
 
     SoapySDR_logf(SOAPY_SDR_TRACE, "listAntennas");
-    
+
     if (direction == SOAPY_SDR_RX)
     {
-        if (channel >= skiq_rx_hdl_end)
+        const skiq_rx_hdl_t hdl = rxHandleForChannel(channel);
+        status = skiq_read_rx_rf_ports_avail_for_hdl(card,
+                                                     hdl,
+                                                     &num_fixed_ports,
+                                                     fixed_ports,
+                                                     &num_trx_ports,
+                                                     trx_ports);
+        if (status != 0)
         {
-            antennas.push_back("NONE");
+            SoapySDR_logf(SOAPY_SDR_WARNING,
+                          "skiq_read_rx_rf_ports_avail_for_hdl failed "
+                          "(card %u, handle %s), status %d",
+                          card, rxHandleName(hdl), status);
+
+            for (uint8_t index = 0;
+                 index < this->param.rx_param[hdl].num_fixed_rf_ports;
+                 index++)
+            {
+                appendRfPortName(antennas,
+                                 this->param.rx_param[hdl].fixed_rf_ports[index]);
+            }
+            for (uint8_t index = 0;
+                 index < this->param.rx_param[hdl].num_trx_rf_ports;
+                 index++)
+            {
+                appendRfPortName(antennas,
+                                 this->param.rx_param[hdl].trx_rf_ports[index]);
+            }
         }
         else
         {
-            if (this->param.rx_param[channel].num_trx_rf_ports > 0)
+            for (uint8_t index = 0; index < num_fixed_ports; index++)
             {
-                antennas.push_back("TRX");
-
+                appendRfPortName(antennas, fixed_ports[index]);
             }
-            else if (this->param.rx_param[channel].num_fixed_rf_ports > 0)
+            for (uint8_t index = 0; index < num_trx_ports; index++)
             {
-                antennas.push_back("RX");
-            }
-            else
-            {
-                antennas.push_back("NONE");
+                appendRfPortName(antennas, trx_ports[index]);
             }
         }
     }
     else if (direction == SOAPY_SDR_TX)
     {
-        if (channel >= skiq_tx_hdl_end)
+        const skiq_tx_hdl_t hdl = txHandleForChannel(channel);
+        status = skiq_read_tx_rf_ports_avail_for_hdl(card,
+                                                     hdl,
+                                                     &num_fixed_ports,
+                                                     fixed_ports,
+                                                     &num_trx_ports,
+                                                     trx_ports);
+        if (status != 0)
         {
-            antennas.push_back("NONE");
+            SoapySDR_logf(SOAPY_SDR_WARNING,
+                          "skiq_read_tx_rf_ports_avail_for_hdl failed "
+                          "(card %u, handle %s), status %d",
+                          card, txHandleName(hdl), status);
+
+            for (uint8_t index = 0;
+                 index < this->param.tx_param[hdl].num_fixed_rf_ports;
+                 index++)
+            {
+                appendRfPortName(antennas,
+                                 this->param.tx_param[hdl].fixed_rf_ports[index]);
+            }
+            for (uint8_t index = 0;
+                 index < this->param.tx_param[hdl].num_trx_rf_ports;
+                 index++)
+            {
+                appendRfPortName(antennas,
+                                 this->param.tx_param[hdl].trx_rf_ports[index]);
+            }
         }
         else
         {
-            if (this->param.tx_param[channel].num_trx_rf_ports > 0)
+            for (uint8_t index = 0; index < num_fixed_ports; index++)
             {
-                antennas.push_back("TRX");
-
+                appendRfPortName(antennas, fixed_ports[index]);
             }
-            else if (this->param.tx_param[channel].num_fixed_rf_ports > 0)
+            for (uint8_t index = 0; index < num_trx_ports; index++)
             {
-                antennas.push_back("TX");
-            }
-            else
-            {
-                antennas.push_back("NONE");
+                appendRfPortName(antennas, trx_ports[index]);
             }
         }
     }
+    else
+    {
+        SoapySDR_logf(SOAPY_SDR_ERROR, "invalid direction %d", direction);
+        throw std::runtime_error("");
+    }
 
+    if (antennas.empty())
+    {
+        antennas.push_back("NONE");
+    }
 
     return antennas;
+}
+
+void SoapySidekiq::setAntenna(const int direction,
+                              const size_t channel,
+                              const std::string &name)
+{
+    int status = 0;
+    uint8_t num_fixed_ports = 0;
+    uint8_t num_trx_ports = 0;
+    skiq_rf_port_t fixed_ports[skiq_rf_port_max] = {};
+    skiq_rf_port_t trx_ports[skiq_rf_port_max] = {};
+    bool transmit = false;
+
+    SoapySDR_logf(SOAPY_SDR_TRACE, "setAntenna");
+
+    if (name == "NONE")
+    {
+        throw std::runtime_error("NONE is not a configurable Sidekiq RF port");
+    }
+
+    if (direction == SOAPY_SDR_RX)
+    {
+        const skiq_rx_hdl_t hdl = rxHandleForChannel(channel);
+        skiq_rf_port_t current_port = skiq_rf_port_unknown;
+
+        status = skiq_read_rx_rf_ports_avail_for_hdl(card,
+                                                     hdl,
+                                                     &num_fixed_ports,
+                                                     fixed_ports,
+                                                     &num_trx_ports,
+                                                     trx_ports);
+        if (status != 0)
+        {
+            SoapySDR_logf(SOAPY_SDR_ERROR,
+                          "skiq_read_rx_rf_ports_avail_for_hdl failed "
+                          "(card %u, handle %s), status %d",
+                          card, rxHandleName(hdl), status);
+            throw std::runtime_error("failed to read RX RF ports");
+        }
+
+        const skiq_rf_port_t requested_port =
+            rfPortFromAntennaName(name,
+                                  fixed_ports,
+                                  num_fixed_ports,
+                                  trx_ports,
+                                  num_trx_ports);
+        if (requested_port == skiq_rf_port_unknown)
+        {
+            throw std::runtime_error("RX antenna " + name +
+                                     " is not available on this channel");
+        }
+
+        status = skiq_read_rx_rf_port_for_hdl(card, hdl, &current_port);
+        if (status == 0 && current_port == requested_port)
+        {
+            SoapySDR_logf(SOAPY_SDR_INFO,
+                          "RX channel %zu handle %s already uses RF port %s",
+                          channel, rxHandleName(hdl), rfPortName(requested_port).c_str());
+            return;
+        }
+        if (status != 0)
+        {
+            SoapySDR_logf(SOAPY_SDR_WARNING,
+                          "skiq_read_rx_rf_port_for_hdl failed "
+                          "(card %u, handle %s), status %d",
+                          card, rxHandleName(hdl), status);
+        }
+
+        const bool use_trx =
+            findPortInList(requested_port, trx_ports, num_trx_ports);
+        const bool use_fixed =
+            findPortInList(requested_port, fixed_ports, num_fixed_ports);
+        if (!use_fixed && !use_trx)
+        {
+            throw std::runtime_error("RX antenna " + name +
+                                     " is not available on this channel");
+        }
+
+        status = skiq_write_rf_port_config(
+            card,
+            use_trx ? skiq_rf_port_config_trx : skiq_rf_port_config_fixed);
+        if (status != 0)
+        {
+            SoapySDR_logf(SOAPY_SDR_ERROR,
+                          "skiq_write_rf_port_config failed "
+                          "(card %u, config %d), status %d",
+                          card,
+                          use_trx ? skiq_rf_port_config_trx : skiq_rf_port_config_fixed,
+                          status);
+            throw std::runtime_error("failed to configure RF port mode");
+        }
+
+        if (use_trx)
+        {
+            status = skiq_write_rf_port_operation(card, transmit);
+            if (status != 0)
+            {
+                SoapySDR_logf(SOAPY_SDR_ERROR,
+                              "skiq_write_rf_port_operation failed "
+                              "(card %u, receive), status %d",
+                              card, status);
+                throw std::runtime_error("failed to configure TRX port operation");
+            }
+        }
+
+        status = skiq_write_rx_rf_port_for_hdl(card, hdl, requested_port);
+        if (status != 0)
+        {
+            SoapySDR_logf(SOAPY_SDR_ERROR,
+                          "skiq_write_rx_rf_port_for_hdl failed "
+                          "(card %u, handle %s, port %s), status %d",
+                          card,
+                          rxHandleName(hdl),
+                          rfPortName(requested_port).c_str(),
+                          status);
+            throw std::runtime_error("failed to configure RX antenna");
+        }
+
+        SoapySDR_logf(SOAPY_SDR_INFO,
+                      "RX channel %zu handle %s uses RF port %s",
+                      channel, rxHandleName(hdl), rfPortName(requested_port).c_str());
+    }
+    else if (direction == SOAPY_SDR_TX)
+    {
+        const skiq_tx_hdl_t hdl = txHandleForChannel(channel);
+        skiq_rf_port_t current_port = skiq_rf_port_unknown;
+        transmit = true;
+
+        status = skiq_read_tx_rf_ports_avail_for_hdl(card,
+                                                     hdl,
+                                                     &num_fixed_ports,
+                                                     fixed_ports,
+                                                     &num_trx_ports,
+                                                     trx_ports);
+        if (status != 0)
+        {
+            SoapySDR_logf(SOAPY_SDR_ERROR,
+                          "skiq_read_tx_rf_ports_avail_for_hdl failed "
+                          "(card %u, handle %s), status %d",
+                          card, txHandleName(hdl), status);
+            throw std::runtime_error("failed to read TX RF ports");
+        }
+
+        const skiq_rf_port_t requested_port =
+            rfPortFromAntennaName(name,
+                                  fixed_ports,
+                                  num_fixed_ports,
+                                  trx_ports,
+                                  num_trx_ports);
+        if (requested_port == skiq_rf_port_unknown)
+        {
+            throw std::runtime_error("TX antenna " + name +
+                                     " is not available on this channel");
+        }
+
+        status = skiq_read_tx_rf_port_for_hdl(card, hdl, &current_port);
+        if (status == 0 && current_port == requested_port)
+        {
+            SoapySDR_logf(SOAPY_SDR_INFO,
+                          "TX channel %zu handle %s already uses RF port %s",
+                          channel, txHandleName(hdl), rfPortName(requested_port).c_str());
+            return;
+        }
+        if (status != 0)
+        {
+            SoapySDR_logf(SOAPY_SDR_WARNING,
+                          "skiq_read_tx_rf_port_for_hdl failed "
+                          "(card %u, handle %s), status %d",
+                          card, txHandleName(hdl), status);
+        }
+
+        const bool use_trx =
+            findPortInList(requested_port, trx_ports, num_trx_ports);
+        const bool use_fixed =
+            findPortInList(requested_port, fixed_ports, num_fixed_ports);
+        if (!use_fixed && !use_trx)
+        {
+            throw std::runtime_error("TX antenna " + name +
+                                     " is not available on this channel");
+        }
+
+        status = skiq_write_rf_port_config(
+            card,
+            use_trx ? skiq_rf_port_config_trx : skiq_rf_port_config_fixed);
+        if (status != 0)
+        {
+            SoapySDR_logf(SOAPY_SDR_ERROR,
+                          "skiq_write_rf_port_config failed "
+                          "(card %u, config %d), status %d",
+                          card,
+                          use_trx ? skiq_rf_port_config_trx : skiq_rf_port_config_fixed,
+                          status);
+            throw std::runtime_error("failed to configure RF port mode");
+        }
+
+        if (use_trx)
+        {
+            status = skiq_write_rf_port_operation(card, transmit);
+            if (status != 0)
+            {
+                SoapySDR_logf(SOAPY_SDR_ERROR,
+                              "skiq_write_rf_port_operation failed "
+                              "(card %u, transmit), status %d",
+                              card, status);
+                throw std::runtime_error("failed to configure TRX port operation");
+            }
+        }
+
+        status = skiq_write_tx_rf_port_for_hdl(card, hdl, requested_port);
+        if (status != 0)
+        {
+            SoapySDR_logf(SOAPY_SDR_ERROR,
+                          "skiq_write_tx_rf_port_for_hdl failed "
+                          "(card %u, handle %s, port %s), status %d",
+                          card,
+                          txHandleName(hdl),
+                          rfPortName(requested_port).c_str(),
+                          status);
+            throw std::runtime_error("failed to configure TX antenna");
+        }
+
+        SoapySDR_logf(SOAPY_SDR_INFO,
+                      "TX channel %zu handle %s uses RF port %s",
+                      channel, txHandleName(hdl), rfPortName(requested_port).c_str());
+    }
+    else
+    {
+        SoapySDR_logf(SOAPY_SDR_ERROR, "invalid direction %d", direction);
+        throw std::runtime_error("");
+    }
+}
+
+std::string SoapySidekiq::getAntenna(const int direction,
+                                     const size_t channel) const
+{
+    int status = 0;
+    skiq_rf_port_t port = skiq_rf_port_unknown;
+    const auto fallbackAntenna = [this, direction, channel]() -> std::string
+    {
+        const std::vector<std::string> antennas = listAntennas(direction, channel);
+        if (!antennas.empty())
+        {
+            return antennas.front();
+        }
+
+        return "NONE";
+    };
+
+    SoapySDR_logf(SOAPY_SDR_TRACE, "getAntenna");
+
+    if (direction == SOAPY_SDR_RX)
+    {
+        const skiq_rx_hdl_t hdl = rxHandleForChannel(channel);
+        status = skiq_read_rx_rf_port_for_hdl(card, hdl, &port);
+        if (status != 0)
+        {
+            SoapySDR_logf(SOAPY_SDR_ERROR,
+                          "skiq_read_rx_rf_port_for_hdl failed "
+                          "(card %u, handle %s), status %d",
+                          card, rxHandleName(hdl), status);
+            return fallbackAntenna();
+        }
+    }
+    else if (direction == SOAPY_SDR_TX)
+    {
+        const skiq_tx_hdl_t hdl = txHandleForChannel(channel);
+        status = skiq_read_tx_rf_port_for_hdl(card, hdl, &port);
+        if (status != 0)
+        {
+            SoapySDR_logf(SOAPY_SDR_ERROR,
+                          "skiq_read_tx_rf_port_for_hdl failed "
+                          "(card %u, handle %s), status %d",
+                          card, txHandleName(hdl), status);
+            return fallbackAntenna();
+        }
+    }
+    else
+    {
+        SoapySDR_logf(SOAPY_SDR_ERROR, "invalid direction %d", direction);
+        throw std::runtime_error("");
+    }
+
+    const std::string name = rfPortName(port);
+    if (name == "NONE")
+    {
+        return fallbackAntenna();
+    }
+
+    return name;
 }
 
 /*******************************************************************
@@ -511,12 +2111,13 @@ bool SoapySidekiq::hasDCOffsetMode(const int direction,
 
     if (direction == SOAPY_SDR_RX)
     {
-        status = skiq_read_rx_cal_types_avail(card, this->rx_hdl, &mask);
+        const skiq_rx_hdl_t hdl = rxHandleForChannel(channel);
+        status = skiq_read_rx_cal_types_avail(card, hdl, &mask);
         if (status != 0)
         {
             SoapySDR_logf(SOAPY_SDR_ERROR, "skiq_read_rx_rx_cal_types_avail failed, "
                           "(card %u, handle %u, mask %d), status %d",
-                          card, rx_hdl, mask, status);
+                          card, hdl, mask, status);
             throw std::runtime_error("");
         }
 
@@ -524,14 +2125,14 @@ bool SoapySidekiq::hasDCOffsetMode(const int direction,
         {
             SoapySDR_logf(SOAPY_SDR_INFO, "card: %u, handle %u, has DC Offest correction, " 
                           "mask is: %d",
-                          card, this->rx_hdl, mask);
+                          card, hdl, mask);
             return true;
         }
         else
         {
             SoapySDR_logf(SOAPY_SDR_INFO, "card: %u, handle %u, does not have DC Offest correction, " 
                           "mask is: %d",
-                          card, this->rx_hdl, mask);
+                          card, hdl, mask);
             return false;
         }
     }
@@ -558,7 +2159,7 @@ void SoapySidekiq::setDCOffsetMode(const int direction,
 
     if (direction == SOAPY_SDR_RX)
     {
-        this->rx_hdl = static_cast<skiq_rx_hdl_t>(channel);
+        this->rx_hdl = rxHandleForChannel(channel);
 
         skiq_rx_cal_mode_t cal_mode = skiq_rx_cal_mode_auto;
 
@@ -602,7 +2203,8 @@ bool SoapySidekiq::getDCOffsetMode(const int direction,
 
     if (direction == SOAPY_SDR_RX)
     {
-        status = skiq_read_rx_cal_mode(card, this->rx_hdl, &cal_mode);
+        const skiq_rx_hdl_t hdl = rxHandleForChannel(channel);
+        status = skiq_read_rx_cal_mode(card, hdl, &cal_mode);
         if (status != 0)
         {
             SoapySDR_logf(SOAPY_SDR_ERROR, "skiq_read_rx_cal_mode failure "
@@ -633,21 +2235,46 @@ bool SoapySidekiq::getDCOffsetMode(const int direction,
  * Gain API
  ******************************************************************/
 
-std::vector<std::string> SoapySidekiq::listGains(const int direction, const size_t channel) const {
-    //  list available gain elements,
+std::vector<std::string> SoapySidekiq::listGains(const int direction,
+                                                 const size_t channel) const
+{
+    (void)channel;
     std::vector<std::string> results;
     SoapySDR_logf(SOAPY_SDR_TRACE, "listGains");
-    results.push_back("LNA");
+
+    if (direction == SOAPY_SDR_RX)
+    {
+        results.push_back("LNA");
+    }
+    else if (direction == SOAPY_SDR_TX)
+    {
+        results.push_back("attenuation");
+    }
+    else
+    {
+        SoapySDR_logf(SOAPY_SDR_ERROR, "invalid direction %d", direction);
+        throw std::runtime_error("");
+    }
+
     return results;
 }
 
-// the Gain API is called for tx attenuation too.
 bool SoapySidekiq::hasGainMode(const int direction, const size_t channel) const
 {
+    (void)channel;
     SoapySDR_logf(SOAPY_SDR_TRACE, "hasGainMode");
 
-    // all Sidekiq cards have rx gain mode and tx attenuation mode
-    return true;
+    if (direction == SOAPY_SDR_RX)
+    {
+        return true;
+    }
+    if (direction == SOAPY_SDR_TX)
+    {
+        return false;
+    }
+
+    SoapySDR_logf(SOAPY_SDR_ERROR, "invalid direction %d", direction);
+    throw std::runtime_error("");
 }
 
 void SoapySidekiq::setGainMode(const int direction, const size_t channel,
@@ -659,7 +2286,7 @@ void SoapySidekiq::setGainMode(const int direction, const size_t channel,
 
     if (direction == SOAPY_SDR_RX)
     {
-        this->rx_hdl = static_cast<skiq_rx_hdl_t>(channel);
+        this->rx_hdl = rxHandleForChannel(channel);
 
         skiq_rx_gain_t mode =
             automatic ? skiq_rx_gain_auto : skiq_rx_gain_manual;
@@ -697,8 +2324,9 @@ bool SoapySidekiq::getGainMode(const int direction, const size_t channel) const
     if (direction == SOAPY_SDR_RX)
     {
         skiq_rx_gain_t p_gain_mode;
+        const skiq_rx_hdl_t hdl = rxHandleForChannel(channel);
 
-        status = skiq_read_rx_gain_mode(card, this->rx_hdl, &p_gain_mode);
+        status = skiq_read_rx_gain_mode(card, hdl, &p_gain_mode);
         if (status != 0)
         {
             SoapySDR_logf(SOAPY_SDR_ERROR,
@@ -707,7 +2335,7 @@ bool SoapySidekiq::getGainMode(const int direction, const size_t channel) const
             throw std::runtime_error("");
         }
         SoapySDR_logf(SOAPY_SDR_INFO, "card: %u, handle: %u, RX gain mode: is %s",
-                      card, this->rx_hdl, p_gain_mode ? "skiq_rx_gain_auto" :
+                      card, hdl, p_gain_mode ? "skiq_rx_gain_auto" :
                       "skiq_rx_gain_manual");
 
         return p_gain_mode;
@@ -731,7 +2359,103 @@ void SoapySidekiq::setGain(const int direction,
                            const std::string &name, 
                            const double value)
 {
-    setGain(direction, channel, value);
+    if (direction == SOAPY_SDR_RX)
+    {
+        if (!isRxGainName(name))
+        {
+            throw std::runtime_error("unsupported RX gain element '" + name + "'");
+        }
+
+        setGain(direction, channel, value);
+        return;
+    }
+
+    if (direction == SOAPY_SDR_TX)
+    {
+        const skiq_tx_hdl_t hdl = txHandleForChannel(channel);
+
+        if (isTxOutputGainName(name))
+        {
+            setGain(direction, channel, value);
+            return;
+        }
+
+        if (!isTxAttenuationName(name))
+        {
+            throw std::runtime_error("unsupported TX gain element '" + name + "'");
+        }
+
+        const SoapySDR::Range range = txAttenuationRangeDb(this->param, hdl);
+        if (!rangeContains(range, value))
+        {
+            SoapySDR_logf(SOAPY_SDR_WARNING,
+                          "card: %u, invalid requested TX attenuation: %.2f dB, "
+                          "acceptable range: %.2f - %.2f dB. No attenuation configured.",
+                          card,
+                          value,
+                          range.minimum(),
+                          range.maximum());
+            return;
+        }
+
+        const uint16_t attenuation_index =
+            txAttenuationIndexFromAttenuationDb(this->param, hdl, value);
+        uint16_t current_attenuation_index = 0;
+        int status = skiq_read_tx_attenuation(card,
+                                              hdl,
+                                              &current_attenuation_index);
+        if (status != 0)
+        {
+            SoapySDR_logf(SOAPY_SDR_ERROR,
+                          "skiq_read_tx_attenuation failed "
+                          "(card %u, handle %u), status %d",
+                          card,
+                          hdl,
+                          status);
+            throw std::runtime_error("");
+        }
+
+        if (current_attenuation_index == attenuation_index)
+        {
+            SoapySDR_logf(SOAPY_SDR_DEBUG,
+                          "card: %u, handle: %u, TX attenuation already %.2f dB "
+                          "(attenuation index: %u)",
+                          card,
+                          hdl,
+                          txAttenuationDbFromAttenuationIndex(this->param,
+                                                              hdl,
+                                                              attenuation_index),
+                          attenuation_index);
+            return;
+        }
+
+        status = skiq_write_tx_attenuation(card, hdl, attenuation_index);
+        if (status != 0)
+        {
+            SoapySDR_logf(SOAPY_SDR_ERROR,
+                          "skiq_write_tx_attenuation failed "
+                          "(card %u, handle %u, attenuation_index %u), status %d",
+                          card,
+                          hdl,
+                          attenuation_index,
+                          status);
+            throw std::runtime_error("");
+        }
+
+        SoapySDR_logf(SOAPY_SDR_INFO,
+                      "card: %u, handle: %u, Setting TX attenuation: %.2f dB "
+                      "(attenuation index: %u)",
+                      card,
+                      hdl,
+                      txAttenuationDbFromAttenuationIndex(this->param,
+                                                          hdl,
+                                                          attenuation_index),
+                      attenuation_index);
+        return;
+    }
+
+    SoapySDR_logf(SOAPY_SDR_ERROR, "invalid direction %d", direction);
+    throw std::runtime_error("");
 }
 
 void SoapySidekiq::setGain(const int direction, 
@@ -743,7 +2467,7 @@ void SoapySidekiq::setGain(const int direction,
 
     if (direction == SOAPY_SDR_RX)
     {
-        this->rx_hdl = static_cast<skiq_rx_hdl_t>(channel);
+        this->rx_hdl = rxHandleForChannel(channel);
 
         // 1. Read current gain mode
         skiq_rx_gain_t gain_mode;
@@ -772,56 +2496,75 @@ void SoapySidekiq::setGain(const int direction,
             }
         }
 
-        // 3. Query gain index range from hardware
-        uint8_t gain_min = 0, gain_max = 0;
-        status = skiq_read_rx_gain_index_range(card, this->rx_hdl, &gain_min, &gain_max);
+        if (!std::isfinite(value))
+        {
+            SoapySDR_logf(SOAPY_SDR_WARNING,
+                          "card: %u, invalid requested RX gain: %.2f dB. "
+                          "No gain configured.",
+                          card,
+                          value);
+            return;
+        }
+
+        const RxGainIndexRange gain_range =
+            readRxGainIndexRange(card, this->rx_hdl);
+        const SoapySDR::Range gain_db_range =
+            rxGainRangeDb(part, this->rx_hdl, gain_range);
+        if (!rangeContains(gain_db_range, value))
+        {
+            SoapySDR_logf(SOAPY_SDR_WARNING,
+                          "card: %u, requested RX gain %.2f dB is outside "
+                          "the supported range %.2f - %.2f dB; clamping",
+                          card,
+                          value,
+                          gain_db_range.minimum(),
+                          gain_db_range.maximum());
+        }
+
+        const uint8_t gain_index =
+            rxGainIndexFromDb(part, this->rx_hdl, gain_range, value);
+        uint8_t current_gain_index = 0;
+        status = skiq_read_rx_gain(card, this->rx_hdl, &current_gain_index);
         if (status != 0)
         {
             SoapySDR_logf(SOAPY_SDR_ERROR,
-                "skiq_read_rx_gain_index_range failed (card %u, channel %zu), status %d",
-                card, channel, status);
+                          "skiq_read_rx_gain failed "
+                          "(card %u, handle %u), status %d",
+                          card,
+                          this->rx_hdl,
+                          status);
             throw std::runtime_error("");
         }
 
-        // 4. Map value in dB to hardware index per device type
-        uint8_t gain_index = gain_min;
-        switch (part)
+        if (current_gain_index == gain_index)
         {
-            case skiq_mpcie:
-            case skiq_m2:
-            case skiq_m2_2280:
-            case skiq_z2:
-            case skiq_z3u:
-                gain_index = (uint8_t)std::round(value); // 1dB/step, 0..76
-                break;
-            case skiq_x4:
-            case skiq_x40:
-            case skiq_x2:
-                gain_index = (uint8_t)(195 + std::round(value * 2.0)); // 0.5dB/step, starts at 195
-                break;
-            case skiq_nv100:
-            case skiq_nvm2:
-                gain_index = (uint8_t)(187 + std::round(value * 2.0)); // 0.5dB/step, starts at 187
-                break;
-            default:
-                SoapySDR_logf(SOAPY_SDR_WARNING, 
-                        "Unknown card type: %u. Not setting gain.", 
-                        (uint8_t)part);
-                return;
+            SoapySDR_logf(SOAPY_SDR_DEBUG,
+                          "card: %u, handle: %u, RX gain already %.2f dB "
+                          "(gain index %u, index range [%u-%u])",
+                          card,
+                          this->rx_hdl,
+                          rxGainDbFromIndex(part,
+                                            this->rx_hdl,
+                                            gain_range,
+                                            gain_index),
+                          gain_index,
+                          gain_range.minimum,
+                          gain_range.maximum);
+            return;
         }
 
-        // 5. Clamp gain index to allowed range
-        if (gain_index < gain_min) gain_index = gain_min;
-        if (gain_index > gain_max) gain_index = gain_max;
-
         SoapySDR_logf(SOAPY_SDR_INFO,
-            "card: %u, handle: %u, Set RX gain: requested %.1f dB (gain_index: %u)," 
-            " range: [%u-%u], set: %u",
-            card, this->rx_hdl, value, gain_index, 
-            gain_min, gain_max, gain_index);
+            "card: %u, handle: %u, Set RX gain: requested %.2f dB, "
+            "actual %.2f dB, gain index %u, index range [%u-%u]",
+            card,
+            this->rx_hdl,
+            value,
+            rxGainDbFromIndex(part, this->rx_hdl, gain_range, gain_index),
+            gain_index,
+            gain_range.minimum,
+            gain_range.maximum);
 
-        // 6. Actually set the gain
-        status = skiq_write_rx_gain(card, rx_hdl, gain_index);
+        status = skiq_write_rx_gain(card, this->rx_hdl, gain_index);
         if (status != 0)
         {
             SoapySDR_logf(SOAPY_SDR_ERROR,
@@ -832,57 +2575,75 @@ void SoapySidekiq::setGain(const int direction,
     }
     else if (direction == SOAPY_SDR_TX)
     {
-        uint16_t attenuation_index = 0;
-        uint32_t max_attenuation_index = this->param.tx_param[tx_hdl].atten_quarter_db_max;
-
-        switch (part)
+        const skiq_tx_hdl_t hdl = txHandleForChannel(channel);
+        const SoapySDR::Range range = txOutputGainRangeDb(this->param, hdl);
+        if (!rangeContains(range, value))
         {
-            case skiq_mpcie:
-            case skiq_m2:
-            case skiq_m2_2280:
-            case skiq_z2:
-            case skiq_z3u:
-                if ((value < 0) || (value > 89.75))
-                {
-                    SoapySDR_logf(SOAPY_SDR_WARNING,
-                        "card: %u, invalid requested attenuation: %3.0f dB," 
-                        "acceptable range: 0 - 89.75 dB. No attenuation configured.",
-                        card, value);
-                    return;
-                }
-                attenuation_index = max_attenuation_index - (uint16_t)std::round(value * 4.0);
-                break;
-
-            case skiq_x4:
-            case skiq_x40:
-            case skiq_x2:
-            case skiq_nv100:
-            case skiq_nvm2:
-                if ((value < 0) || (value > 41.75))
-                {
-                    SoapySDR_logf(SOAPY_SDR_WARNING,
-                        "card: %u, invalid requested attenuation: %3.0f dB, acceptable range: 0 - 41.75 dB. No attenuation configured.",
-                        card, value);
-                    return;
-                }
-                attenuation_index = max_attenuation_index - (uint16_t)std::round(value * 4.0);
-                break;
-
-            default:
-                SoapySDR_logf(SOAPY_SDR_WARNING, "Unknown card type: %u. Not setting TX attenuation.", (uint8_t)part);
-                return;
+            SoapySDR_logf(SOAPY_SDR_WARNING,
+                          "card: %u, invalid requested TX output gain: %.2f dB, "
+                          "acceptable range: %.2f - %.2f dB. No attenuation configured.",
+                          card,
+                          value,
+                          range.minimum(),
+                          range.maximum());
+            return;
         }
 
-        status = skiq_write_tx_attenuation(card, tx_hdl, attenuation_index);
+        const uint16_t attenuation_index =
+            txAttenuationIndexFromOutputGainDb(this->param, hdl, value);
+        uint16_t current_attenuation_index = 0;
+        status = skiq_read_tx_attenuation(card,
+                                          hdl,
+                                          &current_attenuation_index);
         if (status != 0)
         {
             SoapySDR_logf(SOAPY_SDR_ERROR,
-                "skiq_write_tx_gain failed, (card %u, value %f), status %d",
+                          "skiq_read_tx_attenuation failed "
+                          "(card %u, handle %u), status %d",
+                          card,
+                          hdl,
+                          status);
+            throw std::runtime_error("");
+        }
+
+        if (current_attenuation_index == attenuation_index)
+        {
+            SoapySDR_logf(SOAPY_SDR_DEBUG,
+                          "card: %u, handle: %u, TX output gain already %.2f dB "
+                          "(actual attenuation %.2f dB, attenuation index: %u)",
+                          card,
+                          hdl,
+                          txOutputGainDbFromAttenuationIndex(this->param,
+                                                             hdl,
+                                                             attenuation_index),
+                          txAttenuationDbFromAttenuationIndex(this->param,
+                                                              hdl,
+                                                              attenuation_index),
+                          attenuation_index);
+            return;
+        }
+
+        status = skiq_write_tx_attenuation(card, hdl, attenuation_index);
+        if (status != 0)
+        {
+            SoapySDR_logf(SOAPY_SDR_ERROR,
+                "skiq_write_tx_attenuation failed, (card %u, index %u), status %d",
                 card, attenuation_index, status);
             throw std::runtime_error("");
         }
-        SoapySDR_logf(SOAPY_SDR_INFO, "card: %u, Setting tx attenuation: %2.2f dB, attenuation index: %d",
-            card, value, attenuation_index);
+
+        SoapySDR_logf(SOAPY_SDR_INFO,
+                      "card: %u, handle: %u, Setting TX output gain: %.2f dB "
+                      "(actual attenuation %.2f dB, attenuation index: %u)",
+                      card,
+                      hdl,
+                      txOutputGainDbFromAttenuationIndex(this->param,
+                                                         hdl,
+                                                         attenuation_index),
+                      txAttenuationDbFromAttenuationIndex(this->param,
+                                                          hdl,
+                                                          attenuation_index),
+                      attenuation_index);
     }
     else
     {
@@ -893,7 +2654,49 @@ void SoapySidekiq::setGain(const int direction,
 
 double SoapySidekiq::getGain(const int direction, const size_t channel, const std::string &name) const
 {
-    return getGain(direction, channel);
+    if (direction == SOAPY_SDR_RX)
+    {
+        if (!isRxGainName(name))
+        {
+            throw std::runtime_error("unsupported RX gain element '" + name + "'");
+        }
+        return getGain(direction, channel);
+    }
+
+    if (direction == SOAPY_SDR_TX)
+    {
+        const skiq_tx_hdl_t hdl = txHandleForChannel(channel);
+
+        if (isTxOutputGainName(name))
+        {
+            return getGain(direction, channel);
+        }
+
+        if (!isTxAttenuationName(name))
+        {
+            throw std::runtime_error("unsupported TX gain element '" + name + "'");
+        }
+
+        uint16_t attenuation_index = 0;
+        const int status = skiq_read_tx_attenuation(card, hdl, &attenuation_index);
+        if (status != 0)
+        {
+            SoapySDR_logf(SOAPY_SDR_ERROR,
+                          "skiq_read_tx_attenuation failed "
+                          "(card %u, handle %u), status %d",
+                          card,
+                          hdl,
+                          status);
+            throw std::runtime_error("");
+        }
+
+        return txAttenuationDbFromAttenuationIndex(this->param,
+                                                  hdl,
+                                                  attenuation_index);
+    }
+
+    SoapySDR_logf(SOAPY_SDR_ERROR, "invalid direction %d", direction);
+    throw std::runtime_error("");
 }
 
 double SoapySidekiq::getGain(const int direction, const size_t channel) const
@@ -904,7 +2707,8 @@ double SoapySidekiq::getGain(const int direction, const size_t channel) const
     if (direction == SOAPY_SDR_RX)
     {
         uint8_t gain_index;
-        status = skiq_read_rx_gain(card, static_cast<skiq_rx_hdl_t>(channel), &gain_index);
+        const skiq_rx_hdl_t hdl = rxHandleForChannel(channel);
+        status = skiq_read_rx_gain(card, hdl, &gain_index);
         if (status != 0)
         {
             SoapySDR_logf(SOAPY_SDR_ERROR,
@@ -913,35 +2717,16 @@ double SoapySidekiq::getGain(const int direction, const size_t channel) const
             throw std::runtime_error("");
         }
 
-        switch (part)
-        {
-            case skiq_mpcie:
-            case skiq_m2:
-            case skiq_m2_2280:
-            case skiq_z2:
-            case skiq_z3u:
-                return static_cast<double>(gain_index); // 1dB/step
-            case skiq_x2:
-            case skiq_x4:
-            case skiq_x40:
-                return static_cast<double>(gain_index - 195) / 2.0; // 0.5dB/step
-            case skiq_nv100:
-            case skiq_nvm2:
-                return static_cast<double>(gain_index - 187) / 2.0;
-            default:
-                SoapySDR_logf(SOAPY_SDR_WARNING, 
-                              "card: %u, invalid card type %u", 
-                              card, (uint8_t)part);
-                break;
-        }
+        const RxGainIndexRange gain_range = readRxGainIndexRange(card, hdl);
+        return rxGainDbFromIndex(part, hdl, gain_range, gain_index);
     }
     else if (direction == SOAPY_SDR_TX)
     {
+        const skiq_tx_hdl_t hdl = txHandleForChannel(channel);
         uint16_t attenuation_index = 0;
-        uint32_t max_attenuation_index = this->param.tx_param[tx_hdl].atten_quarter_db_max;
 
         status = skiq_read_tx_attenuation(card, 
-                                          static_cast<skiq_tx_hdl_t>(channel), 
+                                          hdl,
                                           &attenuation_index);
         if (status != 0)
         {
@@ -951,7 +2736,9 @@ double SoapySidekiq::getGain(const int direction, const size_t channel) const
             throw std::runtime_error("");
         }
 
-        return (max_attenuation_index - static_cast<int>(attenuation_index)) / 4.0;
+        return txOutputGainDbFromAttenuationIndex(this->param,
+                                                 hdl,
+                                                 attenuation_index);
     }
     else
     {
@@ -967,7 +2754,33 @@ SoapySDR::Range SoapySidekiq::getGainRange(const int    direction,
                                            const std::string & name) const
 {
     SoapySDR_log(SOAPY_SDR_TRACE, "getGainRange with name");
-    return getGainRange(direction, channel);
+
+    if (direction == SOAPY_SDR_RX)
+    {
+        if (!isRxGainName(name))
+        {
+            throw std::runtime_error("unsupported RX gain element '" + name + "'");
+        }
+        return getGainRange(direction, channel);
+    }
+
+    if (direction == SOAPY_SDR_TX)
+    {
+        const skiq_tx_hdl_t hdl = txHandleForChannel(channel);
+        if (isTxOutputGainName(name))
+        {
+            return getGainRange(direction, channel);
+        }
+        if (isTxAttenuationName(name))
+        {
+            return txAttenuationRangeDb(this->param, hdl);
+        }
+
+        throw std::runtime_error("unsupported TX gain element '" + name + "'");
+    }
+
+    SoapySDR_logf(SOAPY_SDR_ERROR, "invalid direction %d", direction);
+    throw std::runtime_error("");
 }
 
 
@@ -978,85 +2791,13 @@ SoapySDR::Range SoapySidekiq::getGainRange(const int    direction,
 
     if (direction == SOAPY_SDR_RX)
     {
-        double gain_min = 0;
-        double gain_max = 0;
-        double step = 0;
-
-
-        // convert index to  dB based upon the card type
-        switch (part)
-        {
-            // 0 to 76 [0 to 76 dB, 1 dB/step]
-            case skiq_mpcie:
-            case skiq_m2:
-            case skiq_m2_2280:
-            case skiq_z2:
-            case skiq_z3u:
-                gain_min = 0;
-                gain_max = 76;
-                step = 1;
-                break;
-
-            // 195 to 255 [0 to 30 dB, 0.5 dB/step]
-            case skiq_x2:
-            case skiq_x4:
-            case skiq_x40:
-                gain_min = 0;
-                gain_max = 30;
-                step = 0.5;
-                break;
-
-            // 187 to 255 [0 to 34 dB, 0.5 dB/step]
-            case skiq_nv100:
-            case skiq_nvm2:
-                gain_min = 0;
-                gain_max = 34;
-                step = 0.5;
-                break;
-
-            default:
-                SoapySDR_logf(SOAPY_SDR_WARNING,
-                        "card: %u, invalid card type %u",
-                        card, (uint8_t)part);
-                break;
-        }
-
-        return SoapySDR::Range(gain_min, gain_max, step);
+        const skiq_rx_hdl_t hdl = rxHandleForChannel(channel);
+        const RxGainIndexRange gain_range = readRxGainIndexRange(card, hdl);
+        return rxGainRangeDb(part, hdl, gain_range);
     }
     else if (direction == SOAPY_SDR_TX)
     {
-        double attenuation_min = 0;
-        double attenuation_max = 0;
-        double attenuation_step = 0;
-
-        // convert index to  dB based upon the card type
-        switch (part)
-        {
-            case skiq_mpcie:
-            case skiq_m2:
-            case skiq_m2_2280:
-            case skiq_z2:
-            case skiq_z3u:
-                attenuation_max = 89.75;
-                attenuation_step = 0.25;
-                break;
-
-            case skiq_x2:
-            case skiq_x4:
-            case skiq_x40:
-            case skiq_nv100:
-            case skiq_nvm2:
-                attenuation_max = 41.75;
-                attenuation_step = 0.25;
-                break;
-
-            default:
-                SoapySDR_logf(SOAPY_SDR_WARNING,
-                              "card: %u, invalid card type %u",
-                              card, (uint8_t)part);
-                break;
-        }
-        return SoapySDR::Range(attenuation_min, attenuation_max, attenuation_step);
+        return txOutputGainRangeDb(this->param, txHandleForChannel(channel));
     }
     else
     {
@@ -1071,35 +2812,60 @@ SoapySDR::Range SoapySidekiq::getGainRange(const int    direction,
  * Frequency API
  ******************************************************************/
 
+void SoapySidekiq::writeRxFrequency(const skiq_rx_hdl_t handle,
+                                    const uint64_t frequency)
+{
+    const int status = skiq_write_rx_LO_freq(this->card, handle, frequency);
+    if (status == -EDOM && rxHandleMayShareLo(handle))
+    {
+        SoapySDR_logf(SOAPY_SDR_WARNING,
+                      "skiq_write_rx_LO_freq rejected secondary RX handle %u; "
+                      "it may share the LO with its primary handle",
+                      handle);
+        return;
+    }
+
+    if (status != 0)
+    {
+        SoapySDR_logf(SOAPY_SDR_ERROR,
+                      "skiq_write_rx_LO_freq failed, (card %u, handle %u, "
+                      "frequency %lu), status %d",
+                      this->card, handle, frequency, status);
+        throw std::runtime_error("");
+    }
+}
+
 void SoapySidekiq::setFrequency(const int direction, const size_t channel,
                   const double frequency, const SoapySDR::Kwargs &args)
 {
     int status = 0;
+    const uint64_t requested_frequency = hzToUint64("frequency", frequency);
 
     SoapySDR_log(SOAPY_SDR_TRACE, "setFrequency");
 
     if (direction == SOAPY_SDR_RX)
     {
-        this->rx_hdl = static_cast<skiq_rx_hdl_t>(channel);
-        this->rx_center_frequency = (uint64_t)frequency;
+        this->rx_hdl = rxHandleForChannel(channel);
+        validateRangeValue("RX frequency",
+                           static_cast<double>(requested_frequency),
+                           getFrequencyRange(direction, channel).front());
 
-        SoapySDR_logf(SOAPY_SDR_INFO, "Setting rx center freq: %lu",
-                      rx_center_frequency);
+        this->rx_center_frequency = requested_frequency;
+        this->rx_center_frequency_by_handle[this->rx_hdl] = this->rx_center_frequency;
 
-        status = skiq_write_rx_LO_freq(this->card, this->rx_hdl, rx_center_frequency);
-        if (status != 0)
-        {
-            SoapySDR_logf(SOAPY_SDR_ERROR,
-                          "skiq_write_rx_LO_freq failed, (card %u, frequency "
-                          "%lu), status %d",
-                          this->card, rx_center_frequency, status);
-            throw std::runtime_error("");
-        }
+        SoapySDR_logf(SOAPY_SDR_INFO, "Setting rx center freq: %lu on handle %u",
+                      rx_center_frequency, this->rx_hdl);
+
+        writeRxFrequency(this->rx_hdl, this->rx_center_frequency);
     }
     else if (direction == SOAPY_SDR_TX)
     {
-        this->tx_hdl = static_cast<skiq_tx_hdl_t>(channel);
-        this->tx_center_frequency = (uint64_t)frequency;
+        this->tx_hdl = txHandleForChannel(channel);
+        validateRangeValue("TX frequency",
+                           static_cast<double>(requested_frequency),
+                           getFrequencyRange(direction, channel).front());
+
+        this->tx_center_frequency = requested_frequency;
 
         SoapySDR_logf(SOAPY_SDR_INFO, "Setting tx center freq: %lu",
                       tx_center_frequency);
@@ -1131,7 +2897,10 @@ double SoapySidekiq::getFrequency(const int direction, const size_t channel) con
     {
         uint64_t freq;
         double   tuned_freq;
-        status = skiq_read_rx_LO_freq(card, rx_hdl, &freq, &tuned_freq);
+        status = skiq_read_rx_LO_freq(card,
+                                      rxHandleForChannel(channel),
+                                      &freq,
+                                      &tuned_freq);
         if (status != 0)
         {
             SoapySDR_logf(SOAPY_SDR_ERROR,
@@ -1145,7 +2914,10 @@ double SoapySidekiq::getFrequency(const int direction, const size_t channel) con
     {
         uint64_t freq;
         double   tuned_freq;
-        status = skiq_read_tx_LO_freq(card, tx_hdl, &freq, &tuned_freq);
+        status = skiq_read_tx_LO_freq(card,
+                                      txHandleForChannel(channel),
+                                      &freq,
+                                      &tuned_freq);
         if (status != 0)
         {
             SoapySDR_logf(SOAPY_SDR_ERROR,
@@ -1213,75 +2985,187 @@ SoapySDR::RangeList SoapySidekiq::getFrequencyRange(const int direction,
  * Sample Rate API
  ******************************************************************/
 
-void SoapySidekiq::setSampleRate(const int direction, const size_t channel,
-                                 const double rate)
+void SoapySidekiq::writeRxSampleRateAndBandwidth(
+        const std::vector<skiq_rx_hdl_t> &handles,
+        const uint32_t sample_rate,
+        const uint32_t bandwidth)
 {
-    int status = 0;
-
-    SoapySDR_log(SOAPY_SDR_TRACE, "setSampleRate");
-
-    if (direction == SOAPY_SDR_RX)
+    if (handles.empty())
     {
-        this->rx_hdl = static_cast<skiq_rx_hdl_t>(channel);
-        this->rx_sample_rate = (uint32_t)rate;
+        SoapySDR_log(SOAPY_SDR_ERROR,
+                     "cannot configure RX sample rate without an RX handle");
+        throw std::runtime_error("");
+    }
 
-        status = skiq_write_rx_sample_rate_and_bandwidth(this->card,
-                                                         this->rx_hdl,
-                                                         rx_sample_rate,
-                                                         this->rx_bandwidth);
-        if (status != 0)
+    const SoapySDR::Range shared_range =
+        intersectSampleRateRanges(this->card, this->param, handles);
+    validateRangeValue("RX sample rate", sample_rate, shared_range);
+
+    for (const auto handle : handles)
+    {
+        validateBuiltInSampleRateIfRequired(
+            "RX sample rate",
+            this->part,
+            sample_rate,
+            rxProfileSampleRates(this->part, this->card, this->param, handle));
+    }
+
+    validateBandwidthAgainstSampleRate("RX bandwidth", bandwidth, sample_rate);
+    if (partRequiresExactBuiltInSampleRate(this->part))
+    {
+        const std::vector<double> bandwidths = nv100BandwidthsForRate(sample_rate);
+        if (!bandwidths.empty() &&
+            !rateMatchesProfile(bandwidths, bandwidth))
         {
-            SoapySDR_logf(SOAPY_SDR_ERROR, "skiq_write_rx_sample_rate_and_bandwidth "
-                          "(card %u, sample_rate %u, bandwidth %u, status %d)",
-                          this->card, rx_sample_rate, this->rx_bandwidth, status);
-            throw std::runtime_error("");
+            SoapySDR_logf(SOAPY_SDR_WARNING,
+                          "RX bandwidth %u Hz is not one of the documented "
+                          "NV100/NVM2 profile percentages for sample rate %u Hz; "
+                          "libsidekiq will accept or reject the request",
+                          bandwidth,
+                          sample_rate);
         }
+    }
 
-        SoapySDR_logf(SOAPY_SDR_INFO, "set rx sample rate: %u", rx_sample_rate);
+    int status = 0;
+    if (handles.size() == 1)
+    {
+        status = skiq_write_rx_sample_rate_and_bandwidth(
+                this->card, handles.front(), sample_rate, bandwidth);
+    }
+    else
+    {
+        std::vector<skiq_rx_hdl_t> mutable_handles(handles.begin(), handles.end());
+        std::vector<uint32_t> sample_rates(handles.size(), sample_rate);
+        std::vector<uint32_t> bandwidths(handles.size(), bandwidth);
 
-        // Validate that the sample rate was set to what was desired.
-        // otherwise log a warning
-        uint32_t actual_rate;
-        double fpga_rate;
-        uint32_t actual_bw;
-        uint32_t fpga_bw;
+        status = skiq_write_rx_sample_rate_and_bandwidth_multi(
+                this->card,
+                mutable_handles.data(),
+                static_cast<uint8_t>(mutable_handles.size()),
+                sample_rates.data(),
+                bandwidths.data());
+    }
+
+    if (status != 0)
+    {
+        SoapySDR_logf(SOAPY_SDR_ERROR,
+                      "RX sample rate/bandwidth programming failed, "
+                      "(card %u, handles %zu, sample_rate %u, bandwidth %u, status %d)",
+                      this->card, handles.size(), sample_rate, bandwidth, status);
+        throw std::runtime_error("");
+    }
+
+    uint32_t configured_rate = sample_rate;
+    uint32_t configured_bandwidth = bandwidth;
+
+    for (const auto handle : handles)
+    {
+        uint32_t actual_rate = 0;
+        double fpga_rate = 0;
+        uint32_t actual_bw = 0;
+        uint32_t fpga_bw = 0;
 
         status = skiq_read_rx_sample_rate_and_bandwidth(this->card,
-                                                        this->rx_hdl,
+                                                        handle,
                                                         &actual_rate,
                                                         &fpga_rate,
                                                         &actual_bw,
                                                         &fpga_bw);
         if (status != 0)
         {
-            SoapySDR_logf(SOAPY_SDR_ERROR, "card: %u, skiq_read_rx_sample_rate_and_bandwidth "
-                          "failed, status: %d",
-                          this->card, status);
+            SoapySDR_logf(SOAPY_SDR_ERROR,
+                          "skiq_read_rx_sample_rate_and_bandwidth failed "
+                          "(card %u, handle %u), status %d",
+                          this->card, handle, status);
             throw std::runtime_error("");
         }
 
-        if (rx_sample_rate != actual_rate)
+        if (sample_rate != actual_rate)
         {
-            SoapySDR_logf(SOAPY_SDR_WARNING, "requested RX rate: %u, is not the same as "
-                          "the actual rate: %u",
-                          rx_sample_rate, actual_rate);
+            SoapySDR_logf(SOAPY_SDR_WARNING,
+                          "requested RX rate on handle %u: %u, actual rate: %u",
+                          handle, sample_rate, actual_rate);
         }
+
+        if (bandwidth != actual_bw)
+        {
+            SoapySDR_logf(SOAPY_SDR_WARNING,
+                          "requested RX bandwidth on handle %u: %u, actual bandwidth: %u",
+                          handle, bandwidth, actual_bw);
+        }
+
+        configured_rate = actual_rate;
+        configured_bandwidth = actual_bw;
+    }
+
+    this->rx_sample_rate = configured_rate;
+    this->rx_bandwidth = configured_bandwidth;
+}
+
+void SoapySidekiq::setSampleRate(const int direction, const size_t channel,
+                                 const double rate)
+{
+    int status = 0;
+    const uint32_t requested_rate = hzToUint32("sample rate", rate);
+
+    SoapySDR_log(SOAPY_SDR_TRACE, "setSampleRate");
+
+    if (direction == SOAPY_SDR_RX)
+    {
+        this->rx_hdl = rxHandleForChannel(channel);
+        uint32_t requested_bandwidth = this->rx_bandwidth;
+        if (requested_bandwidth > requested_rate)
+        {
+            requested_bandwidth = requested_rate;
+            SoapySDR_logf(SOAPY_SDR_INFO,
+                          "clamping RX bandwidth to sample rate while setting rate: %u",
+                          requested_bandwidth);
+        }
+
+        std::vector<skiq_rx_hdl_t> handles{this->rx_hdl};
+        if (!rx_stream_handles.empty() &&
+            std::find(rx_stream_handles.begin(), rx_stream_handles.end(),
+                      this->rx_hdl) != rx_stream_handles.end())
+        {
+            handles = rx_stream_handles;
+        }
+
+        writeRxSampleRateAndBandwidth(handles, requested_rate, requested_bandwidth);
+        SoapySDR_logf(SOAPY_SDR_INFO, "set rx sample rate: %u", this->rx_sample_rate);
     }
     else if (direction == SOAPY_SDR_TX)
     {
-        this->tx_hdl = static_cast<skiq_tx_hdl_t>(channel);
-        this->tx_sample_rate = (uint32_t)rate;
+        this->tx_hdl = txHandleForChannel(channel);
+        validateRangeValue(
+            "TX sample rate",
+            requested_rate,
+            txSampleRateRangeForHandle(this->card, this->param, this->tx_hdl));
+        validateBuiltInSampleRateIfRequired(
+            "TX sample rate",
+            this->part,
+            requested_rate,
+            txProfileSampleRates(this->part, this->card, this->param, this->tx_hdl));
+
+        this->tx_sample_rate = requested_rate;
+        uint32_t requested_bandwidth = this->tx_bandwidth;
+        if (requested_bandwidth > this->tx_sample_rate)
+        {
+            requested_bandwidth = this->tx_sample_rate;
+            SoapySDR_logf(SOAPY_SDR_INFO,
+                          "clamping TX bandwidth to sample rate while setting rate: %u",
+                          requested_bandwidth);
+        }
 
         status = skiq_write_tx_sample_rate_and_bandwidth(this->card,
                                                          this->tx_hdl,
                                                          tx_sample_rate,
-                                                         this->tx_bandwidth);
+                                                         requested_bandwidth);
         if (status != 0)
         {
             SoapySDR_logf(SOAPY_SDR_ERROR,
                           "skiq_write_tx_sample_rate_and_bandwidth failed, "
                           "(card %u, sample_rate %u, bandwidth %u, status %d)",
-                          this->card, tx_sample_rate, tx_bandwidth, status);
+                          this->card, tx_sample_rate, requested_bandwidth, status);
             throw std::runtime_error("");
         }
         SoapySDR_logf(SOAPY_SDR_INFO, "set tx sample rate: %u", tx_sample_rate);
@@ -1313,6 +3197,9 @@ void SoapySidekiq::setSampleRate(const int direction, const size_t channel,
                           "the actual rate: %u",
                           tx_sample_rate, actual_rate);
         }
+
+        this->tx_sample_rate = actual_rate;
+        this->tx_bandwidth = actual_bw;
     }
     else
     {
@@ -1332,7 +3219,10 @@ double SoapySidekiq::getSampleRate(const int    direction,
 
     if (direction == SOAPY_SDR_RX)
     {
-        status = skiq_read_rx_sample_rate(card, rx_hdl, &rate, &actual_rate);
+        status = skiq_read_rx_sample_rate(card,
+                                          rxHandleForChannel(channel),
+                                          &rate,
+                                          &actual_rate);
         if (status != 0)
         {
             SoapySDR_logf(SOAPY_SDR_ERROR,
@@ -1340,11 +3230,14 @@ double SoapySidekiq::getSampleRate(const int    direction,
                           card, status);
             throw std::runtime_error("");
         }
-        return static_cast<double>(rate);
+        return actual_rate;
     }
     else if (direction == SOAPY_SDR_TX)
     {
-        status = skiq_read_tx_sample_rate(card, tx_hdl, &rate, &actual_rate);
+        status = skiq_read_tx_sample_rate(card,
+                                          txHandleForChannel(channel),
+                                          &rate,
+                                          &actual_rate);
         if (status != 0)
         {
             SoapySDR_logf(SOAPY_SDR_ERROR,
@@ -1352,7 +3245,7 @@ double SoapySidekiq::getSampleRate(const int    direction,
                           card, status);
             throw std::runtime_error("");
         }
-        return static_cast<double>(rate);
+        return actual_rate;
     }
     else
     {
@@ -1366,30 +3259,25 @@ double SoapySidekiq::getSampleRate(const int    direction,
 SoapySDR::RangeList SoapySidekiq::getSampleRateRange(const int direction,
                                                      const size_t channel) const
 {
-    int                 status = 0;
-    uint32_t            min_sample_rate;
-    uint32_t            max_sample_rate;
     SoapySDR::RangeList ranges;
 
     SoapySDR_log(SOAPY_SDR_TRACE, "getSampleRateRange");
 
-    status = skiq_read_min_sample_rate(card, &min_sample_rate);
-    if (status != 0)
+    if (direction == SOAPY_SDR_RX)
     {
-        SoapySDR_logf(SOAPY_SDR_ERROR,
-                      "skiq_read_min_sample_rate failed, (card %u), status %d",
-                      card, status);
+        ranges.push_back(
+            rxSampleRateRangeForHandle(card, param, rxHandleForChannel(channel)));
+    }
+    else if (direction == SOAPY_SDR_TX)
+    {
+        ranges.push_back(
+            txSampleRateRangeForHandle(card, param, txHandleForChannel(channel)));
+    }
+    else
+    {
+        SoapySDR_logf(SOAPY_SDR_ERROR, "invalid direction %d", direction);
         throw std::runtime_error("");
     }
-    status = skiq_read_max_sample_rate(card, &max_sample_rate);
-    if (status != 0)
-    {
-        SoapySDR_logf(SOAPY_SDR_ERROR,
-                      "skiq_read_max_sample_rate (card %u), status %d",
-                      card, status);
-        throw std::runtime_error("");
-    }
-    ranges.push_back(SoapySDR::Range(min_sample_rate, max_sample_rate));
 
     return ranges;
 }
@@ -1403,55 +3291,33 @@ void SoapySidekiq::setBandwidth(const int direction, const size_t channel,
 
     if (direction == SOAPY_SDR_RX)
     {
-        this->rx_hdl = static_cast<skiq_rx_hdl_t>(channel);
-        this->rx_bandwidth = (uint32_t)bw;
-
-        status       = skiq_write_rx_sample_rate_and_bandwidth(this->card,
-                                                               this->rx_hdl,
-                                                               this->rx_sample_rate,
-                                                               rx_bandwidth);
-        if (status != 0)
+        this->rx_hdl = rxHandleForChannel(channel);
+        const uint32_t requested_bandwidth = hzToUint32("bandwidth", bw);
+        std::vector<skiq_rx_hdl_t> handles{this->rx_hdl};
+        if (!rx_stream_handles.empty() &&
+            std::find(rx_stream_handles.begin(), rx_stream_handles.end(),
+                      this->rx_hdl) != rx_stream_handles.end())
         {
-            SoapySDR_logf(SOAPY_SDR_ERROR, "skiq_write_rx_sample_rate_and_bandwidth failed "
-                          "(card %u, sample_rate %u, bandwidth %u, status %d)",
-                          this->card, this->rx_sample_rate, rx_bandwidth, status);
-            throw std::runtime_error("");
+            handles = rx_stream_handles;
         }
 
-        SoapySDR_logf(SOAPY_SDR_INFO, "set rx bandwidth to %u", rx_bandwidth);
+        validateBandwidthAgainstSampleRate("RX bandwidth",
+                                           requested_bandwidth,
+                                           this->rx_sample_rate);
 
-        // validate that the bandwidth was set to what was desired.
-        // otherwise log a warning
-        uint32_t actual_rate;
-        double fpga_rate;
-        uint32_t actual_bw;
-        uint32_t fpga_bw;
-
-        status = skiq_read_rx_sample_rate_and_bandwidth(this->card,
-                                                        this->rx_hdl,
-                                                        &actual_rate,
-                                                        &fpga_rate,
-                                                        &actual_bw,
-                                                        &fpga_bw);
-        if (status != 0)
-        {
-            SoapySDR_logf(SOAPY_SDR_ERROR, "skiq_read_rx_sample_rate_and_bandwidth failed "
-                          "(card %u, sample_rate %u, bandwidth %u, status %u)",
-                          this->card, this->rx_sample_rate, rx_bandwidth, status);
-            throw std::runtime_error("");
-        }
-
-        if (rx_bandwidth != actual_bw)
-        {
-            SoapySDR_logf(SOAPY_SDR_WARNING, "requested bandwidth: %u, is not the same as "
-                          "actual bandwidth: %u",
-                          rx_bandwidth, actual_bw);
-        }
+        writeRxSampleRateAndBandwidth(
+                handles, this->rx_sample_rate, requested_bandwidth);
+        SoapySDR_logf(SOAPY_SDR_INFO, "set rx bandwidth to %u", this->rx_bandwidth);
     }
     else if (direction == SOAPY_SDR_TX)
     {
-        this->tx_hdl = static_cast<skiq_tx_hdl_t>(channel);
-        this->tx_bandwidth = (uint32_t)bw;
+        this->tx_hdl = txHandleForChannel(channel);
+        const uint32_t requested_bandwidth = hzToUint32("bandwidth", bw);
+        validateBandwidthAgainstSampleRate("TX bandwidth",
+                                           requested_bandwidth,
+                                           this->tx_sample_rate);
+
+        this->tx_bandwidth = requested_bandwidth;
 
         status = skiq_write_tx_sample_rate_and_bandwidth(this->card,
                                                          this->tx_hdl,
@@ -1494,6 +3360,9 @@ void SoapySidekiq::setBandwidth(const int direction, const size_t channel,
                           " is not the same as actual bandwidth: %u",
                           tx_bandwidth, actual_bw);
         }
+
+        this->tx_sample_rate = actual_rate;
+        this->tx_bandwidth = actual_bw;
     }
     else
     {
@@ -1503,32 +3372,176 @@ void SoapySidekiq::setBandwidth(const int direction, const size_t channel,
 }
 
 /***********************************************************
- * Some open source call listSampleRates and want a list of available 
- * sample rates.  For AD9361 cards, these have contiguous sample rates 
- * available.
- * For other cards, there are profiles and there are only specific rates available
- * For now we will just give a list of min-max, with steps of 250k Hz.
+ * Some open source applications call listSampleRates() when they need concrete
+ * choices.  getSampleRateRange() still reports the SDK min/max range for the
+ * active handle, but profile-backed radios may only support documented values
+ * within that range.  AD9361/AD9364-based cards keep the stepped range fallback.
  */
-std::vector<double> SoapySidekiq::listSampleRates(const int direction, const size_t channel) const {
-  std::vector<double> results;
+std::vector<double> SoapySidekiq::listSampleRates(const int direction, const size_t channel) const
+{
+    if (direction == SOAPY_SDR_RX)
+    {
+        const skiq_rx_hdl_t handle = rxHandleForChannel(channel);
+        const std::vector<double> profile_rates =
+            rxProfileSampleRates(part, card, param, handle);
+        if (!profile_rates.empty())
+        {
+            return profile_rates;
+        }
+    }
+    else if (direction == SOAPY_SDR_TX)
+    {
+        const skiq_tx_hdl_t handle = txHandleForChannel(channel);
+        const std::vector<double> profile_rates =
+            txProfileSampleRates(part, card, param, handle);
+        if (!profile_rates.empty())
+        {
+            return profile_rates;
+        }
+    }
+    else
+    {
+        SoapySDR_logf(SOAPY_SDR_ERROR, "invalid direction %d", direction);
+        throw std::runtime_error("");
+    }
 
-  uint32_t min_sample_rate;
-  if (skiq_read_min_sample_rate(card, &min_sample_rate) != 0) {
-    SoapySDR_logf(SOAPY_SDR_ERROR, "Failure: skiq_read_min_sample_rate (card %d)", card);
-  }
-  uint32_t max_sample_rate;
-  if (skiq_read_max_sample_rate(card, &max_sample_rate) != 0) {
-    SoapySDR_logf(SOAPY_SDR_ERROR, "Failure: skiq_read_min_sample_rate (card %d)", card);
-  }
+    constexpr double step = 250000.0;
+    return steppedValuesForRanges(getSampleRateRange(direction, channel), step);
+}
 
-  //  iterate through all sample rates
-  uint32_t sample_rate = min_sample_rate;
-  while (sample_rate <= max_sample_rate) {
-    results.push_back(sample_rate);
-    sample_rate += 250000;
-  }
+SoapySDR::RangeList SoapySidekiq::getBandwidthRange(const int direction,
+                                                     const size_t channel) const
+{
+    SoapySDR::RangeList ranges;
 
-  return results;
+    SoapySDR_log(SOAPY_SDR_TRACE, "getBandwidthRange");
+
+    if (direction == SOAPY_SDR_RX)
+    {
+        const skiq_rx_hdl_t handle = rxHandleForChannel(channel);
+        if (partRequiresExactBuiltInSampleRate(part))
+        {
+            const uint32_t rate =
+                this->rx_sample_rate == 0 ? DEFAULT_SAMPLE_RATE : this->rx_sample_rate;
+            const std::vector<double> bandwidths = nv100BandwidthsForRate(rate);
+            if (!bandwidths.empty())
+            {
+                ranges.push_back(SoapySDR::Range(bandwidths.front(),
+                                                 bandwidths.back()));
+                return ranges;
+            }
+        }
+
+        const std::vector<double> profile_bandwidths =
+            bandwidthsFromProfilesForRate(rxProfilesForPart(part),
+                                          rxHandleMask(handle),
+                                          this->rx_sample_rate);
+        if (!profile_bandwidths.empty())
+        {
+            ranges.push_back(SoapySDR::Range(profile_bandwidths.front(),
+                                             profile_bandwidths.back()));
+            return ranges;
+        }
+
+        const SoapySDR::Range sample_range =
+            rxSampleRateRangeForHandle(card, param, handle);
+        ranges.push_back(SoapySDR::Range(sample_range.minimum(),
+                                         this->rx_sample_rate == 0
+                                             ? sample_range.maximum()
+                                             : std::min<double>(sample_range.maximum(),
+                                                                this->rx_sample_rate)));
+    }
+    else if (direction == SOAPY_SDR_TX)
+    {
+        const skiq_tx_hdl_t handle = txHandleForChannel(channel);
+        if (partRequiresExactBuiltInSampleRate(part))
+        {
+            const uint32_t rate =
+                this->tx_sample_rate == 0 ? DEFAULT_SAMPLE_RATE : this->tx_sample_rate;
+            const std::vector<double> bandwidths = nv100BandwidthsForRate(rate);
+            if (!bandwidths.empty())
+            {
+                ranges.push_back(SoapySDR::Range(bandwidths.front(),
+                                                 bandwidths.back()));
+                return ranges;
+            }
+        }
+
+        const std::vector<double> profile_bandwidths =
+            bandwidthsFromProfilesForRate(txProfilesForPart(part),
+                                          txHandleMask(handle),
+                                          this->tx_sample_rate);
+        if (!profile_bandwidths.empty())
+        {
+            ranges.push_back(SoapySDR::Range(profile_bandwidths.front(),
+                                             profile_bandwidths.back()));
+            return ranges;
+        }
+
+        const SoapySDR::Range sample_range =
+            txSampleRateRangeForHandle(card, param, handle);
+        ranges.push_back(SoapySDR::Range(sample_range.minimum(),
+                                         this->tx_sample_rate == 0
+                                             ? sample_range.maximum()
+                                             : std::min<double>(sample_range.maximum(),
+                                                                this->tx_sample_rate)));
+    }
+    else
+    {
+        SoapySDR_logf(SOAPY_SDR_ERROR, "invalid direction %d", direction);
+        throw std::runtime_error("");
+    }
+
+    return ranges;
+}
+
+std::vector<double> SoapySidekiq::listBandwidths(const int direction,
+                                                 const size_t channel) const
+{
+    if (direction == SOAPY_SDR_RX)
+    {
+        const skiq_rx_hdl_t handle = rxHandleForChannel(channel);
+        if (partRequiresExactBuiltInSampleRate(part))
+        {
+            return nv100BandwidthsForRate(
+                this->rx_sample_rate == 0 ? DEFAULT_SAMPLE_RATE : this->rx_sample_rate);
+        }
+
+        std::vector<double> profile_bandwidths =
+            bandwidthsFromProfilesForRate(rxProfilesForPart(part),
+                                          rxHandleMask(handle),
+                                          this->rx_sample_rate);
+        if (!profile_bandwidths.empty())
+        {
+            return profile_bandwidths;
+        }
+    }
+    else if (direction == SOAPY_SDR_TX)
+    {
+        const skiq_tx_hdl_t handle = txHandleForChannel(channel);
+        if (partRequiresExactBuiltInSampleRate(part))
+        {
+            return nv100BandwidthsForRate(
+                this->tx_sample_rate == 0 ? DEFAULT_SAMPLE_RATE : this->tx_sample_rate);
+        }
+
+        std::vector<double> profile_bandwidths =
+            bandwidthsFromProfilesForRate(txProfilesForPart(part),
+                                          txHandleMask(handle),
+                                          this->tx_sample_rate);
+        if (!profile_bandwidths.empty())
+        {
+            return profile_bandwidths;
+        }
+    }
+    else
+    {
+        SoapySDR_logf(SOAPY_SDR_ERROR, "invalid direction %d", direction);
+        throw std::runtime_error("");
+    }
+
+    constexpr double step = 250000.0;
+    return steppedValuesForRanges(getBandwidthRange(direction, channel), step);
 }
 
 double SoapySidekiq::getBandwidth(const int    direction,
@@ -1543,7 +3556,9 @@ double SoapySidekiq::getBandwidth(const int    direction,
     SoapySDR_log(SOAPY_SDR_TRACE, "getBandwidth");
     if (direction == SOAPY_SDR_RX)
     {
-        status = skiq_read_rx_sample_rate_and_bandwidth(card, rx_hdl, &rate,
+        status = skiq_read_rx_sample_rate_and_bandwidth(card,
+                                                   rxHandleForChannel(channel),
+                                                   &rate,
                                                    &actual_rate, &bandwidth,
                                                    &actual_bandwidth);
         if (status != 0)
@@ -1557,7 +3572,9 @@ double SoapySidekiq::getBandwidth(const int    direction,
     }
     else if (direction == SOAPY_SDR_TX)
     {
-        status = skiq_read_tx_sample_rate_and_bandwidth(card, tx_hdl, &rate,
+        status = skiq_read_tx_sample_rate_and_bandwidth(card,
+                                                   txHandleForChannel(channel),
+                                                   &rate,
                                                    &actual_rate, &bandwidth,
                                                    &actual_bandwidth);
         if (status != 0)
@@ -1576,7 +3593,7 @@ double SoapySidekiq::getBandwidth(const int    direction,
         throw std::runtime_error("");
     }
 
-    return bandwidth;
+    return actual_bandwidth;
 }
 
 /*******************************************************************
@@ -1660,40 +3677,31 @@ void SoapySidekiq::writeSetting(const std::string &key,
     // make sure the case of the key doesn't matter
     else if (equalsIgnoreCase(key, "counter"))
     {
-        if (value == "true")
+        const bool counter_enabled = (value == "true");
+        const skiq_data_src_t data_source =
+            counter_enabled ? skiq_data_src_counter : skiq_data_src_iq;
+        const std::vector<skiq_rx_hdl_t> handles =
+            rx_stream_handles.empty()
+                ? std::vector<skiq_rx_hdl_t>{rx_hdl}
+                : rx_stream_handles;
+
+        for (const auto handle : handles)
         {
-            status = skiq_write_rx_data_src(this->card,
-                                            this->rx_hdl,
-                                            skiq_data_src_counter);
+            status = skiq_write_rx_data_src(this->card, handle, data_source);
             if (status != 0)
             {
                 SoapySDR_logf(SOAPY_SDR_ERROR,
-                              "skiq_write_rx_data_src failed, card: %u status: %d",
-                              this->card, status);
+                              "skiq_write_rx_data_src failed, card: %u handle: %u status: %d",
+                              this->card, handle, status);
                 throw std::runtime_error("");
             }
-            else
-            {
-                SoapySDR_log(SOAPY_SDR_INFO, "set rx src to counter mode ");
-                counter = true;
-            }
         }
-        else
-        {
-            status = skiq_write_rx_data_src(card, rx_hdl, skiq_data_src_iq);
-            if (status != 0)
-            {
-                SoapySDR_logf(SOAPY_SDR_ERROR,
-                              "skiq_write_rx_data_src failed, card: %u status: %d",
-                              card, status);
-                throw std::runtime_error("");
-            }
-            else
-            {
-                SoapySDR_log(SOAPY_SDR_INFO, "set rx src to normal, not counter, mode ");
-                counter = false;
-            }
-        }
+
+        counter = counter_enabled;
+        SoapySDR_logf(SOAPY_SDR_INFO,
+                      "set rx source to %s mode for %zu handle(s)",
+                      counter ? "counter" : "normal",
+                      handles.size());
     }
     // make sure the case of the key doesn't matter
     else if (equalsIgnoreCase(key, "timetype"))
@@ -2210,4 +4218,3 @@ double SoapySidekiq::getReferenceClockRate(void) const
 
     return 0;
 }
-

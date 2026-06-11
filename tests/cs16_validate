@@ -189,7 +189,7 @@ def parse_command_line_arguments():
     parser.add_argument('-r', type=float, required=False, dest='rate',
                         default=20e6, help='Sample Rate')
     parser.add_argument('-bw', type=float, required=False, dest='bw',
-                        default=18e6, help='Bandwidth')
+                        default=16e6, help='Bandwidth')
     parser.add_argument('-f', type=float, required=False, dest='freq',
                         default=1000e6, help='Frequency')
 
@@ -210,5 +210,4 @@ if __name__ == '__main__':
     print("freq (-f)\t:", pars.freq/1000000)
 
     main(pars.card, pars.handle, pars.rate, pars.bw, pars.freq)
-
 
