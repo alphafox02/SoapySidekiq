@@ -26,6 +26,14 @@
 #define SLEEP_1SEC (1 * 1000000)
 #define NANOS_IN_SEC (1000000000ULL)
 
+#if defined(LIBSIDEKIQ_VERSION) && (LIBSIDEKIQ_VERSION >= 42400)
+#define SOAPYSIDEKIQ_HAS_SDK_X40_PART 1
+#define SOAPYSIDEKIQ_HAS_SDK_NVM2_PART 1
+#else
+#define SOAPYSIDEKIQ_HAS_SDK_X40_PART 0
+#define SOAPYSIDEKIQ_HAS_SDK_NVM2_PART 0
+#endif
+
 
 class SoapySidekiq : public SoapySDR::Device
 {
@@ -50,6 +58,9 @@ class SoapySidekiq : public SoapySDR::Device
          ******************************************************************/
 
         size_t getNumChannels(const int) const;
+
+        SoapySDR::Kwargs getChannelInfo(const int direction,
+                const size_t channel) const override;
 
         /*******************************************************************
          * Stream API
@@ -110,6 +121,13 @@ class SoapySidekiq : public SoapySDR::Device
         std::vector<std::string> listAntennas(const int direction, 
                 const size_t channel  ) const;
 
+        void setAntenna(const int direction,
+                const size_t channel,
+                const std::string &name) override;
+
+        std::string getAntenna(const int direction,
+                const size_t channel) const override;
+
 
         /*******************************************************************
          * Frontend corrections API
@@ -129,23 +147,23 @@ class SoapySidekiq : public SoapySDR::Device
          * Gain API
          ******************************************************************/
 
-        std::vector<std::string> listGains(const int direction, 
-                const size_t channel) const;
+        std::vector<std::string> listGains(const int direction,
+                const size_t channel) const override;
 
         bool hasGainMode(const int direction,
-                const size_t channel) const;
+                const size_t channel) const override;
 
         void setGainMode(const int direction,
                 const size_t channel,
-                const bool automatic);
+                const bool automatic) override;
 
         bool getGainMode(const int direction,
-                const size_t channel) const;
+                const size_t channel) const override;
 
         void setGain(const int direction,
                 const size_t channel,
                 const std::string &name,
-                const double value);
+                const double value) override;
 
         void setGain(const int direction,
                 const size_t channel,
@@ -156,14 +174,14 @@ class SoapySidekiq : public SoapySDR::Device
                 const std::string &name) const override;
 
         double getGain(const int direction,
-                const size_t channel) const;
+                const size_t channel) const override;
 
         SoapySDR::Range getGainRange(const int direction,
                 const size_t channel,
-                const std::string & name) const;
+                const std::string & name) const override;
 
         SoapySDR::Range getGainRange(const int    direction,
-                const size_t channel) const;
+                const size_t channel) const override;
 
         /*******************************************************************
          * Frequency API
@@ -201,6 +219,12 @@ class SoapySidekiq : public SoapySDR::Device
 
         double getBandwidth(const int direction,
                 const size_t channel) const;
+
+        std::vector<double> listBandwidths(const int direction,
+                const size_t channel) const override;
+
+        SoapySDR::RangeList getBandwidthRange(const int direction,
+                const size_t channel) const override;
 
         /*******************************************************************
          * Sensor API
@@ -253,6 +277,18 @@ class SoapySidekiq : public SoapySDR::Device
     private:
         long long convert_timestamp_to_nanos(const uint64_t timestamp, 
                                              const uint64_t timestamp_freq) const;
+        skiq_rx_hdl_t rxHandleForChannel(const size_t channel) const;
+        skiq_tx_hdl_t txHandleForChannel(const size_t channel) const;
+        size_t mappedRxChannel(const size_t channel) const;
+        void writeRxFrequency(const skiq_rx_hdl_t handle,
+                              const uint64_t frequency);
+        void writeRxSampleRateAndBandwidth(
+                const std::vector<skiq_rx_hdl_t> &handles,
+                const uint32_t sample_rate,
+                const uint32_t bandwidth);
+        double rxFullScaleForHandle(const skiq_rx_hdl_t handle) const;
+        double txFullScaleForHandle(const skiq_tx_hdl_t handle) const;
+        double nativeFullScale(const int direction, const size_t channel) const;
 
         SoapySDR::Stream *const TX_STREAM = (SoapySDR::Stream *)0x1;
         SoapySDR::Stream *const RX_STREAM = (SoapySDR::Stream *)0x2;
@@ -260,12 +296,21 @@ class SoapySidekiq : public SoapySDR::Device
         //  sidekiq card
         std::string part_str;
         skiq_part_t part;
-        skiq_param_t param;
+        skiq_param_t param{};
         uint8_t card{};
         std::basic_string<char> serial{};
         std::basic_string<char> timeSource{};
         uint32_t resolution{};
         double maxValue{};
+        bool sidekiq_card_acquired{};
+
+        static std::mutex sidekiq_init_mutex;
+        static bool sidekiq_library_initialized;
+        static unsigned sidekiq_instance_count;
+        static unsigned sidekiq_card_ref_count[SKIQ_MAX_NUM_CARDS];
+        static void acquireSidekiqCard(const uint8_t card,
+                                       const skiq_xport_init_level_t level);
+        static void releaseSidekiqCard(const uint8_t card);
 
         bool rxUseShort{};
         bool txUseShort{};
@@ -275,18 +320,24 @@ class SoapySidekiq : public SoapySDR::Device
         std::mutex rx_mutex;
         std::condition_variable _cv;
         std::basic_string<char> timetype{};
-        static bool rx_running;
+        bool rx_running{};
+        bool rx_start_signal{};
+        bool tx_start_signal{};
         bool rx_receive_operation_exited_due_to_error{};
 
+        bool rx_channel_alias_enabled{};
+        size_t rx_channel_alias{};
         uint8_t num_rx_channels{};
         skiq_rx_hdl_t rx_hdl{};
         uint64_t rx_center_frequency{};
+        uint64_t rx_center_frequency_by_handle[skiq_rx_hdl_end]{};
         uint32_t rx_sample_rate{};
         uint32_t rx_bandwidth{};
         uint32_t rx_block_size_in_words{};
         uint32_t rx_block_size_in_bytes{};
         uint32_t rx_payload_size_in_bytes{};
         uint32_t rx_payload_size_in_words{};
+        std::vector<skiq_rx_hdl_t> rx_stream_handles;
 
         //  tx
         std::mutex tx_mutex;
@@ -316,18 +367,34 @@ class SoapySidekiq : public SoapySDR::Device
         uint64_t sys_freq{};
 
         // RX buffer
-        skiq_rx_block_t *p_rx_block[DEFAULT_NUM_BUFFERS];
-        uint32_t rxReadIndex{};
-        uint32_t rxWriteIndex{};
+        skiq_rx_block_t *p_rx_block[skiq_rx_hdl_end][DEFAULT_NUM_BUFFERS]{};
+        uint32_t rxReadIndex[skiq_rx_hdl_end]{};
+        uint32_t rxWriteIndex[skiq_rx_hdl_end]{};
+        bool rx_handle_enabled[skiq_rx_hdl_end]{};
+        bool rx_first_block[skiq_rx_hdl_end]{};
+        uint64_t rx_expected_timestamp[skiq_rx_hdl_end]{};
 
         // Buffer for leftover RX samples to allow readStream() to return arbitrary numElems
-        std::vector<int16_t> rx_fifo_buffer;
-        size_t rx_fifo_offset = 0;
+        std::vector<int16_t> rx_fifo_buffer[skiq_rx_hdl_end];
+        size_t rx_fifo_offset[skiq_rx_hdl_end]{};
+        long long rx_fifo_time_ns[skiq_rx_hdl_end]{};
+        long long rx_fifo_time_step_ns{};
 
         // TX buffer
         skiq_tx_block_t *p_tx_block[DEFAULT_NUM_BUFFERS];
         uint32_t currTXBuffIndex{};
         uint32_t p_tx_block_index{};
+        std::vector<uint8_t> tx_staging_buffer;
+        size_t tx_staging_fill{};
+        size_t tx_bytes_per_sample{};
+
+        struct passedStruct
+        {
+            SoapySidekiq *classAddr;
+            uint32_t txIndex;
+        };
+
+        passedStruct tx_contexts[DEFAULT_NUM_BUFFERS]{};
 
 
         // TX callback static function
@@ -348,8 +415,6 @@ class SoapySidekiq : public SoapySDR::Device
 
             // Call the member function
             self->tx_complete(status, p_data, txIndex);
-
-            delete instance;
         }
 
         // TX enabled callback static function
@@ -368,15 +433,9 @@ class SoapySidekiq : public SoapySDR::Device
 
         static SoapySidekiq *thisClassAddr;
 
+        int transmitBlock(const uint8_t *data);
+
     public:
-        struct passedStruct
-        {
-            SoapySidekiq *classAddr;
-            uint32_t txIndex;
-        };
-
-        passedStruct *passedStructInstance;
-
         //  receive thread
         std::thread _rx_receive_thread;
         void rx_receive_operation(void);
@@ -393,5 +452,3 @@ class SoapySidekiq : public SoapySDR::Device
         // tx enabled callback
         void tx_enabled(uint8_t card, int32_t status);
 };
-
-

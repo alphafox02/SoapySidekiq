@@ -240,8 +240,8 @@ def main(cardno, serial,
         sdr.setGainMode(SOAPY_SDR_RX, rx_handle, True)
 
     if attenuation is not None:
-        sdr.setGain(SOAPY_SDR_TX, tx_handle, float(attenuation))
-        setattenuation = sdr.getGain(SOAPY_SDR_TX, tx_handle)
+        sdr.setGain(SOAPY_SDR_TX, tx_handle, "attenuation", float(attenuation))
+        setattenuation = sdr.getGain(SOAPY_SDR_TX, tx_handle, "attenuation")
         SoapySDR.log(SoapySDR.SOAPY_SDR_INFO, f"actual attenuation: {setattenuation} dB ")
     else:
         sdr.setGain(SOAPY_SDR_TX, tx_handle, float(0))

@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+
+import argparse
+import sys
+
+import numpy as np
+import SoapySDR
+from SoapySDR import SOAPY_SDR_CS16, SOAPY_SDR_RX
+
+
+def validate_counter(buffer, fullscale, label):
+    expected = int(buffer[0])
+    for idx, value in enumerate(buffer):
+        if int(value) != expected:
+            window_start = max(0, idx - 5)
+            window_end = min(len(buffer), idx + 5)
+            print(f"{label}: bad value at {idx}, expected {expected}, value {int(value)}")
+            print(buffer[window_start:window_end])
+            return False
+
+        expected += 1
+        if expected == fullscale + 1:
+            expected = -(fullscale + 1)
+
+    return True
+
+
+def main(args):
+    SoapySDR.setLogLevel(args.log_level)
+
+    sdr = SoapySDR.Device({"card": args.card})
+    sdr.writeSetting("counter", "true")
+    sdr.writeSetting("iq_swap", "false")
+    sdr.writeSetting("timetype", "rf_timestamp")
+
+    channels = [int(item) for item in args.channels.split(",") if item != ""]
+    if not channels:
+        raise RuntimeError("at least one RX channel is required")
+
+    for channel in channels:
+        sdr.setSampleRate(SOAPY_SDR_RX, channel, args.rate)
+        sdr.setBandwidth(SOAPY_SDR_RX, channel, args.bandwidth)
+        sdr.setFrequency(SOAPY_SDR_RX, channel, args.frequency)
+        sdr.setGainMode(SOAPY_SDR_RX, channel, True)
+
+    rx_stream = sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16, channels)
+    mtu = sdr.getStreamMTU(rx_stream)
+    count = mtu * args.blocks
+
+    fullscale = int(sdr.getNativeStreamFormat(SOAPY_SDR_RX, 0).fullScale)
+    buffers = [np.empty(2 * count, dtype=np.int16) for _ in channels]
+
+    sdr.setHardwareTime(0, "now")
+    sdr.activateStream(rx_stream)
+    try:
+        for idx in range(args.reads):
+            result = sdr.readStream(rx_stream, buffers, count, timeoutUs=args.timeout_us)
+            if result.ret != count:
+                raise RuntimeError(
+                    f"read {idx} returned {result.ret}, expected {count}"
+                )
+
+            ok = True
+            for chan_idx, channel in enumerate(channels):
+                ok = validate_counter(
+                    buffers[chan_idx],
+                    fullscale,
+                    f"channel {channel}",
+                ) and ok
+
+            if not ok:
+                return 1
+
+            print(
+                f"read {idx}: {count} samples/channel "
+                f"channels={channels} timeNs={result.timeNs}"
+            )
+    finally:
+        sdr.deactivateStream(rx_stream)
+        sdr.closeStream(rx_stream)
+        sdr.writeSetting("counter", "false")
+
+    return 0
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        description="Validate multi-channel CS16 RX using FPGA counter mode"
+    )
+    parser.add_argument("-c", "--card", default="0")
+    parser.add_argument("--channels", default="0,1")
+    parser.add_argument("-s", "--rate", type=float, default=20e6)
+    parser.add_argument("-bw", "--bandwidth", type=float, default=16e6)
+    parser.add_argument("-f", "--frequency", type=float, default=1000e6)
+    parser.add_argument("--blocks", type=int, default=4)
+    parser.add_argument("--reads", type=int, default=10)
+    parser.add_argument("--timeout-us", type=int, default=10000000)
+    parser.add_argument("--log-level", type=int, default=SoapySDR.SOAPY_SDR_WARNING)
+    return parser.parse_args(argv)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(parse_args(sys.argv[1:])))
