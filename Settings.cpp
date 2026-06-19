@@ -234,9 +234,13 @@ double rxGainStepDb(const skiq_part_t part, const skiq_rx_hdl_t handle)
         case skiq_x2:
             return handle == skiq_rx_hdl_B1 ? 1.0 : 0.5;
         case skiq_x4:
+#if SOAPYSIDEKIQ_HAS_SDK_X40_PART
         case skiq_x40:
+#endif
         case skiq_nv100:
+#if SOAPYSIDEKIQ_HAS_SDK_NVM2_PART
         case skiq_nvm2:
+#endif
             return 0.5;
         case skiq_mpcie:
         case skiq_m2:
@@ -823,7 +827,9 @@ std::vector<ProfileEntry> rxProfilesForPart(const skiq_part_t part)
             };
 
         case skiq_x4:
+#if SOAPYSIDEKIQ_HAS_SDK_X40_PART
         case skiq_x40:
+#endif
             return {
                 profile(500000000, RX_C1 | RX_D1, 450000000, 400000000),
                 profile(491520000, RX_C1 | RX_D1, 450000000, 400000000),
@@ -840,7 +846,9 @@ std::vector<ProfileEntry> rxProfilesForPart(const skiq_part_t part)
             };
 
         case skiq_nv100:
+#if SOAPYSIDEKIQ_HAS_SDK_NVM2_PART
         case skiq_nvm2:
+#endif
             return nv100Profiles(libsidekiqAtLeast(4, 24, 0), RX_ALL_NV100);
 
         default:
@@ -878,6 +886,7 @@ std::vector<ProfileEntry> txProfilesForPart(const skiq_part_t part)
                 profile(50000000, TX_ALL_X4, 41000000, 20000000)
             };
 
+#if SOAPYSIDEKIQ_HAS_SDK_X40_PART
         case skiq_x40:
             return {
                 profile(500000000, TX_A1 | TX_B1, 450000000, 400000000),
@@ -893,9 +902,12 @@ std::vector<ProfileEntry> txProfilesForPart(const skiq_part_t part)
                 profile(61440000, TX_A1 | TX_B1, 50000000, 25000000),
                 profile(50000000, TX_A1 | TX_B1, 41000000, 20000000)
             };
+#endif
 
         case skiq_nv100:
+#if SOAPYSIDEKIQ_HAS_SDK_NVM2_PART
         case skiq_nvm2:
+#endif
             return nv100Profiles(libsidekiqAtLeast(4, 24, 0), TX_ALL_NV100);
 
         default:
@@ -1010,7 +1022,11 @@ std::vector<double> bandwidthsFromProfilesForRate(
 
 bool partRequiresExactBuiltInSampleRate(const skiq_part_t part)
 {
-    return part == skiq_nv100 || part == skiq_nvm2;
+    return part == skiq_nv100
+#if SOAPYSIDEKIQ_HAS_SDK_NVM2_PART
+        || part == skiq_nvm2
+#endif
+        ;
 }
 
 void validateBuiltInSampleRateIfRequired(const std::string &what,

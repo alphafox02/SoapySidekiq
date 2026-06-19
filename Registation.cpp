@@ -67,10 +67,7 @@ const char *partStringOrEmpty(const char *part)
 std::vector<DiscoveryAlias> discoveryAliasesForPart(const DiscoveryPart &part)
 {
     const std::string nv100 = partStringOrEmpty(SKIQ_PART_NUM_STRING_NV100);
-    const std::string nvm2 = partStringOrEmpty(SKIQ_PART_NUM_STRING_NVM2);
-
-    if ((!nv100.empty() && part.number == nv100) ||
-        (!nvm2.empty() && part.number == nvm2))
+    if (!nv100.empty() && part.number == nv100)
     {
         return {
             {0, "A1"},
@@ -78,6 +75,18 @@ std::vector<DiscoveryAlias> discoveryAliasesForPart(const DiscoveryPart &part)
             {2, "B1"},
         };
     }
+
+#if SOAPYSIDEKIQ_HAS_SDK_NVM2_PART
+    const std::string nvm2 = partStringOrEmpty(SKIQ_PART_NUM_STRING_NVM2);
+    if (!nvm2.empty() && part.number == nvm2)
+    {
+        return {
+            {0, "A1"},
+            {1, "A2"},
+            {2, "B1"},
+        };
+    }
+#endif
 
     return {};
 }

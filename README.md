@@ -79,12 +79,15 @@ driver=sidekiq,serial=B124
 
 Some applications, including common Gqrx Soapy flows, open one RX channel and
 do not expose a separate channel selector. For those applications, include the
-requested RX channel in the device string:
+requested RX path in the device string with `rx_channel`:
 
 ```text
-driver=sidekiq,card=0,channel=1
-soapy=0,driver=sidekiq,card=0,channel=1
+driver=sidekiq,card=0,rx_channel=1
+soapy=0,driver=sidekiq,card=0,rx_channel=1
 ```
+
+`channel=` remains accepted as a compatibility alias, but `rx_channel=` is the
+clearer spelling for single-client RX path selection.
 
 Soapy channel numbers select Sidekiq RX handles. Soapy antenna names select RF
 ports for the chosen handle. Use `SoapySDRUtil --probe` to inspect the mapping
@@ -97,6 +100,11 @@ RX supports `CS16` and `CF32` streams. TX accepts `CS16` and `CF32`, with
 
 Multi-channel RX uses the non-conflicting RX handles reported by the Sidekiq
 SDK. TX supports one channel per active TX stream.
+
+The `rx_channel` alias is intended to improve selected-path operation in
+single-client applications such as Gqrx. It does not bypass libsidekiq card
+ownership, so multiple independent processes still cannot open the same
+Sidekiq card simultaneously.
 
 Sample rates and bandwidths are reported through the Soapy range and list APIs.
 On profile-based radios such as NV100/NVM2, the broad min/max range does not
@@ -157,6 +165,9 @@ FPGA image, and `libsidekiq` runtime.
   value manually.
 - If a selected channel has unexpected RF ports, remember that stream channel
   selection and antenna/RF-port selection are separate Soapy concepts.
+- If one Gqrx instance is already using a card, a second Gqrx process will
+  still fail to open that same card until the first process releases the
+  libsidekiq card lock.
 - If changing sample rate or bandwidth fails on NV100/NVM2, use one of the
   listed RFIC profile rates and a compatible bandwidth.
 
