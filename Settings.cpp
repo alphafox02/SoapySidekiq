@@ -1110,6 +1110,13 @@ std::vector<double> nv100BandwidthsForRate(const uint32_t rate)
     return values;
 }
 
+bool bandwidthDiffersSignificantly(const uint32_t requested, const uint32_t actual)
+{
+    const double difference =
+        std::abs(static_cast<double>(actual) - static_cast<double>(requested));
+    return requested == 0 || difference > 0.05 * static_cast<double>(requested);
+}
+
 void validateBandwidthAgainstSampleRate(const std::string &what,
                                         const uint32_t bandwidth,
                                         const uint32_t sample_rate)
@@ -3353,7 +3360,11 @@ void SoapySidekiq::writeRxSampleRateAndBandwidth(
 
         if (bandwidth != actual_bw)
         {
-            SoapySDR_logf(SOAPY_SDR_WARNING,
+            // the RFIC filters come in discrete steps, so small differences are
+            // expected; only warn when the applied bandwidth is well off
+            SoapySDR_logf(bandwidthDiffersSignificantly(bandwidth, actual_bw)
+                              ? SOAPY_SDR_WARNING
+                              : SOAPY_SDR_INFO,
                           "requested RX bandwidth on handle %s: %u Hz, actual bandwidth: %u Hz",
                           rxHandleName(handle), bandwidth, actual_bw);
         }
@@ -3426,7 +3437,11 @@ void SoapySidekiq::writeTxSampleRateAndBandwidth(const skiq_tx_hdl_t handle,
 
     if (bandwidth != actual_bw)
     {
-        SoapySDR_logf(SOAPY_SDR_WARNING,
+        // the RFIC filters come in discrete steps, so small differences are
+        // expected; only warn when the applied bandwidth is well off
+        SoapySDR_logf(bandwidthDiffersSignificantly(bandwidth, actual_bw)
+                          ? SOAPY_SDR_WARNING
+                          : SOAPY_SDR_INFO,
                       "requested TX bandwidth on handle %s: %u Hz, actual bandwidth: %u Hz",
                       txHandleName(handle), bandwidth, actual_bw);
     }
