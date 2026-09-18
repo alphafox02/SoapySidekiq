@@ -262,8 +262,11 @@ void SoapySidekiq::tx_streaming_start(void)
         SoapySDR_logf(SOAPY_SDR_ERROR,
                 "skiq_start_tx_streaming_on_1pps failed, (card %u) status %d",
                 card, status);
+        tx_start_state = TX_START_FAILED;
         return;
     }
+
+    tx_start_state = TX_START_DONE;
 
     SoapySDR_logf(SOAPY_SDR_INFO, "TX start streaming on 1pps completed");
 }
@@ -701,6 +704,11 @@ SoapySDR::Stream *SoapySidekiq::setupStream(const int direction,
 
         for (int i = 0; i < DEFAULT_NUM_TX_BUFFERS; i++)
         {
+            // completion callback context for this slot; written only here,
+            // before any block is sent, so the callback threads only read it
+            tx_contexts[i].classAddr = this;
+            tx_contexts[i].txIndex = static_cast<uint32_t>(i);
+
             p_tx_block[i] = skiq_tx_block_allocate(current_tx_block_size);
             if (p_tx_block[i] == NULL)
             {
@@ -1011,10 +1019,9 @@ int SoapySidekiq::activateStream(SoapySDR::Stream *stream,
             }
 
             tx_start_signal = false;
+            tx_start_state = TX_START_PENDING;
             _tx_streaming_thread =
                 std::thread(&SoapySidekiq::tx_streaming_start, this);
-
-            first_transmit = true;
 
             // Notify the thread to run
             {
@@ -1036,6 +1043,7 @@ int SoapySidekiq::activateStream(SoapySDR::Stream *stream,
             SoapySDR_logf(SOAPY_SDR_INFO,
                     "started transmit streaming on handle: %u",
                     tx_hdl);
+            tx_start_state = TX_START_DONE;
         }
 
         tx_stream_active = true;
@@ -1128,21 +1136,25 @@ int SoapySidekiq::deactivateStream(SoapySDR::Stream *stream, const int flags,
     }
     else if (stream == TX_STREAM)
     {
-        if (tx_staging_fill > 0 && !tx_staging_buffer.empty())
+        // send the last partial block, padded with zeros, if the stream is
+        // actually running
+        if (tx_staging_fill > 0 && !tx_staging_buffer.empty() &&
+            tx_start_state == TX_START_DONE)
         {
             memset(tx_staging_buffer.data() + tx_staging_fill,
                    0,
                    tx_staging_buffer.size() - tx_staging_fill);
-            status = transmitBlock(tx_staging_buffer.data());
-            tx_staging_fill = 0;
+            status = transmitBlock(tx_staging_buffer.data(),
+                                   std::chrono::steady_clock::now() +
+                                       std::chrono::seconds(1));
             if (status != 0)
             {
-                SoapySDR_logf(SOAPY_SDR_ERROR,
-                              "failed to flush final TX block, status %d",
-                              status);
-                throw std::runtime_error("");
+                SoapySDR_logf(SOAPY_SDR_WARNING,
+                              "could not send the final partial TX block (%s)",
+                              SoapySDR_errToStr(status));
             }
         }
+        tx_staging_fill = 0;
 
         if (flags == SOAPY_SDR_HAS_TIME)
         {
@@ -1195,6 +1207,7 @@ int SoapySidekiq::deactivateStream(SoapySDR::Stream *stream, const int flags,
         }
 
         tx_stream_active = false;
+        tx_start_state = TX_START_IDLE;
     }
 
     return 0;
@@ -1527,9 +1540,34 @@ void SoapySidekiq::waitForTxSpace(void)
     pthread_mutex_unlock(&space_avail_mutex);
 }
 
-int SoapySidekiq::transmitBlock(const uint8_t *inbuff_ptr)
+// Send one full TX block.  Returns 0, SOAPY_SDR_TIMEOUT if no ring slot or
+// libsidekiq queue space became available before the deadline, or
+// SOAPY_SDR_STREAM_ERROR.
+int SoapySidekiq::transmitBlock(const uint8_t *inbuff_ptr,
+                                const std::chrono::steady_clock::time_point deadline)
 {
-    int status = 0;
+    // claim the next ring slot before touching its data: it may still be in
+    // flight from the previous pass around the ring
+    while (true)
+    {
+        tx_buf_mutex.lock();
+        if (p_tx_status[currTXBuffIndex] == 0)
+        {
+            p_tx_status[currTXBuffIndex] = 1;
+            tx_buf_mutex.unlock();
+            break;
+        }
+        tx_buf_mutex.unlock();
+
+        if (std::chrono::steady_clock::now() >= deadline)
+        {
+            return SOAPY_SDR_TIMEOUT;
+        }
+        // wait for a packet to complete, then check again; the wait is short
+        // so a completion that lands before we start waiting is not missed
+        waitForTxSpace();
+    }
+
     uint8_t *outbuff_ptr = (uint8_t *)p_tx_block[currTXBuffIndex]->data;
     const size_t tx_block_bytes = current_tx_block_size * sizeof(int16_t) * 2;
 
@@ -1553,53 +1591,35 @@ int SoapySidekiq::transmitBlock(const uint8_t *inbuff_ptr)
 
     while (true)
     {
-        // need to make sure that we don't update the timestamp of a packet
-        // that is already in use
-        tx_buf_mutex.lock();
-        if (p_tx_status[currTXBuffIndex] == 0)
-        {
-            p_tx_status[currTXBuffIndex] = 1;
-        }
-        else
-        {
-            tx_buf_mutex.unlock();
-            // wait for a packet to complete, then check again; the timeout
-            // covers a completion that lands before we start waiting
-            waitForTxSpace();
-            continue;
-        }
-        tx_buf_mutex.unlock();
-
-        tx_contexts[currTXBuffIndex].classAddr = this;
-        tx_contexts[currTXBuffIndex].txIndex = currTXBuffIndex;
-
-        // transmit the buffer
-        status = skiq_transmit(this->card,
-                               this->tx_hdl,
-                               this->p_tx_block[currTXBuffIndex],
-                               &tx_contexts[currTXBuffIndex]);
-        if (status == SKIQ_TX_ASYNC_SEND_QUEUE_FULL)
-        {
-            // update the in use status since we didn't actually send it yet
-            tx_buf_mutex.lock();
-            p_tx_status[currTXBuffIndex] = 0;
-            tx_buf_mutex.unlock();
-
-            // if there's no space left to send, wait until there should be space available
-            waitForTxSpace();
-        }
-        else if (status != 0)
-        {
-            SoapySDR_logf(SOAPY_SDR_ERROR, "skiq_transmit failed, (card %u) status %d",
-                          card, status);
-            throw std::runtime_error("");
-        }
-        else
+        const int status = skiq_transmit(this->card,
+                                         this->tx_hdl,
+                                         this->p_tx_block[currTXBuffIndex],
+                                         &tx_contexts[currTXBuffIndex]);
+        if (status == 0)
         {
             // move the index into the transmit block array
             currTXBuffIndex = (currTXBuffIndex + 1) % DEFAULT_NUM_TX_BUFFERS;
             return 0;
         }
+
+        if (status != SKIQ_TX_ASYNC_SEND_QUEUE_FULL)
+        {
+            SoapySDR_logf(SOAPY_SDR_ERROR, "skiq_transmit failed, (card %u) status %d",
+                          card, status);
+        }
+        else if (std::chrono::steady_clock::now() < deadline)
+        {
+            // libsidekiq's queue is full: wait for a packet to complete
+            waitForTxSpace();
+            continue;
+        }
+
+        // not sent: release the slot so it can be used again
+        tx_buf_mutex.lock();
+        p_tx_status[currTXBuffIndex] = 0;
+        tx_buf_mutex.unlock();
+        return (status == SKIQ_TX_ASYNC_SEND_QUEUE_FULL) ? SOAPY_SDR_TIMEOUT
+                                                         : SOAPY_SDR_STREAM_ERROR;
     }
 }
 
@@ -1608,21 +1628,32 @@ int SoapySidekiq::writeStream(SoapySDR::Stream * stream,
                               int &flags, const long long timeNs,
                               const long timeoutUs)
 {
-    int status = 0;
-
     if (stream != TX_STREAM)
     {
         return SOAPY_SDR_NOT_SUPPORTED;
     }
-
-    if (first_transmit == true)
+    if (!tx_stream_active)
     {
-        SoapySDR_logf(SOAPY_SDR_DEBUG, "writeStream waiting on enabled");
+        return SOAPY_SDR_STREAM_ERROR;
+    }
 
-        pthread_mutex_lock(&tx_enabled_mutex);
-        pthread_cond_wait(&tx_enabled_cond, &tx_enabled_mutex);
-        pthread_mutex_unlock(&tx_enabled_mutex);
-        first_transmit = false;
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::microseconds(timeoutUs > 0 ? timeoutUs : 0);
+
+    // After a 1PPS-timed activateStream(), libsidekiq only accepts data once
+    // the stream has started on the PPS edge.  Its TX-enabled callback fires
+    // earlier than that, so wait for the start itself.
+    while (tx_start_state == TX_START_PENDING)
+    {
+        if (std::chrono::steady_clock::now() >= deadline)
+        {
+            return SOAPY_SDR_TIMEOUT;
+        }
+        usleep(1000);
+    }
+    if (tx_start_state != TX_START_DONE)
+    {
+        return SOAPY_SDR_STREAM_ERROR;
     }
 
     if (tx_bytes_per_sample == 0)
@@ -1632,34 +1663,40 @@ int SoapySidekiq::writeStream(SoapySDR::Stream * stream,
     }
 
     const uint8_t *input = reinterpret_cast<const uint8_t *>(buffs[0]);
-    size_t bytes_left = numElems * tx_bytes_per_sample;
-    size_t input_offset = 0;
+    size_t consumed = 0;
 
-    while (bytes_left > 0)
+    while (true)
     {
-        const size_t space_left = tx_staging_buffer.size() - tx_staging_fill;
-        const size_t chunk = std::min(space_left, bytes_left);
-
-        memcpy(tx_staging_buffer.data() + tx_staging_fill,
-               input + input_offset,
-               chunk);
-
-        tx_staging_fill += chunk;
-        input_offset += chunk;
-        bytes_left -= chunk;
-
+        // a full staging block (possibly left from a call that timed out)
+        // has to go out before more samples can be taken
         if (tx_staging_fill == tx_staging_buffer.size())
         {
-            status = transmitBlock(tx_staging_buffer.data());
+            const int status = transmitBlock(tx_staging_buffer.data(), deadline);
             if (status != 0)
             {
-                return SOAPY_SDR_STREAM_ERROR;
+                return (consumed > 0) ? static_cast<int>(consumed) : status;
             }
             tx_staging_fill = 0;
         }
+
+        if (consumed == numElems)
+        {
+            break;
+        }
+
+        const size_t space_samples =
+            (tx_staging_buffer.size() - tx_staging_fill) / tx_bytes_per_sample;
+        const size_t chunk = std::min(space_samples, numElems - consumed);
+
+        memcpy(tx_staging_buffer.data() + tx_staging_fill,
+               input + consumed * tx_bytes_per_sample,
+               chunk * tx_bytes_per_sample);
+
+        tx_staging_fill += chunk * tx_bytes_per_sample;
+        consumed += chunk;
     }
 
-    return numElems;
+    return static_cast<int>(consumed);
 }
 
 int SoapySidekiq::readStreamStatus(SoapySDR::Stream *stream,

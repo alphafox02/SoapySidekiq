@@ -3,6 +3,7 @@
 #include <sidekiq_api.h>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <memory>
@@ -407,7 +408,10 @@ class SoapySidekiq : public SoapySDR::Device
         pthread_cond_t space_avail_cond;
         bool space_avail{};
         int32_t *p_tx_status{};
-        bool first_transmit{};
+        // TX start state.  A 1PPS-timed start runs skiq_start_tx_streaming_on_1pps()
+        // on its own thread; libsidekiq rejects skiq_transmit() until it returns.
+        enum TxStartState { TX_START_IDLE, TX_START_PENDING, TX_START_DONE, TX_START_FAILED };
+        std::atomic<int> tx_start_state{TX_START_IDLE};
 
         uint8_t  num_tx_channels{};
         skiq_tx_hdl_t tx_hdl{};
@@ -415,7 +419,8 @@ class SoapySidekiq : public SoapySDR::Device
         uint32_t tx_sample_rate_by_handle[skiq_tx_hdl_end]{};
         uint32_t tx_bandwidth_by_handle[skiq_tx_hdl_end]{};
         uint32_t tx_underruns{};
-        uint32_t complete_count{};
+        // incremented from libsidekiq's TX completion threads
+        std::atomic<uint32_t> complete_count{};
         uint32_t current_tx_block_size{};
 
         //  setting
@@ -498,7 +503,8 @@ class SoapySidekiq : public SoapySDR::Device
         static void static_tx_enabled_callback(uint8_t card, int32_t status);
 
         void waitForTxSpace(void);
-        int transmitBlock(const uint8_t *data);
+        int transmitBlock(const uint8_t *data,
+                          const std::chrono::steady_clock::time_point deadline);
 
     public:
         // Serializes libsidekiq calls that are not thread safe (library
