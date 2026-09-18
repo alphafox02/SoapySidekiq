@@ -218,6 +218,22 @@ class SoapySidekiq : public SoapySDR::Device
                 const double frequency,
                 const SoapySDR::Kwargs &args = SoapySDR::Kwargs());
 
+        // Sidekiq tunes one element, the RF LO, exposed as "RF"
+        std::vector<std::string> listFrequencies(const int direction,
+                const size_t channel) const override;
+
+        void setFrequency(const int direction, const size_t channel,
+                const std::string &name,
+                const double frequency,
+                const SoapySDR::Kwargs &args = SoapySDR::Kwargs()) override;
+
+        double getFrequency(const int direction, const size_t channel,
+                const std::string &name) const override;
+
+        SoapySDR::RangeList getFrequencyRange(const int direction,
+                const size_t channel,
+                const std::string &name) const override;
+
         double getFrequency(const int direction,
                 const size_t channel) const;
 

@@ -3156,6 +3156,49 @@ void SoapySidekiq::setFrequency(const int direction, const size_t channel,
     }
 }
 
+namespace
+{
+void requireRfElement(const std::string &name)
+{
+    if (!equalsIgnoreCase(name, "RF"))
+    {
+        throw std::runtime_error("unknown frequency element '" + name +
+                                 "'; the Sidekiq tunes only the \"RF\" element");
+    }
+}
+}
+
+std::vector<std::string> SoapySidekiq::listFrequencies(const int direction,
+                                                       const size_t channel) const
+{
+    (void)direction;
+    (void)channel;
+    return {"RF"};
+}
+
+void SoapySidekiq::setFrequency(const int direction, const size_t channel,
+                                const std::string &name, const double frequency,
+                                const SoapySDR::Kwargs &args)
+{
+    requireRfElement(name);
+    setFrequency(direction, channel, frequency, args);
+}
+
+double SoapySidekiq::getFrequency(const int direction, const size_t channel,
+                                  const std::string &name) const
+{
+    requireRfElement(name);
+    return getFrequency(direction, channel);
+}
+
+SoapySDR::RangeList SoapySidekiq::getFrequencyRange(const int direction,
+                                                    const size_t channel,
+                                                    const std::string &name) const
+{
+    requireRfElement(name);
+    return getFrequencyRange(direction, channel);
+}
+
 double SoapySidekiq::getFrequency(const int direction, const size_t channel) const
 {
     int status = 0;
