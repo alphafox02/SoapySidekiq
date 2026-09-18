@@ -137,6 +137,14 @@ RX supports `CS16` and `CF32` streams. TX accepts `CS16` and `CF32`, with
 Multi-channel RX uses the non-conflicting RX handles reported by the Sidekiq
 SDK. TX supports one channel per active TX stream.
 
+The driver buffers received samples for applications that briefly fall
+behind: 500 ms per channel at the stream's sample rate by default. Change it
+with the `buffer_ms` stream argument, for example `buffer_ms=2000`. If the
+application falls further behind than that, samples are dropped and the next
+`readStream()` call at the gap returns `SOAPY_SDR_OVERFLOW`; the same happens
+for any other discontinuity, such as retuning while streaming. Samples
+returned by a single `readStream()` call are always contiguous.
+
 The `rx_channel` alias is intended to improve selected-path operation in
 single-client applications such as Gqrx. It does not bypass libsidekiq card
 ownership, so multiple independent processes still cannot open the same
