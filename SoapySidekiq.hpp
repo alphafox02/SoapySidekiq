@@ -350,10 +350,11 @@ class SoapySidekiq : public SoapySDR::Device
         std::mutex rx_mutex;
         std::condition_variable rx_cv;
         std::basic_string<char> timetype{};
-        bool rx_running{};
+        // shared between the application thread and the RX/TX worker threads
+        std::atomic<bool> rx_running{};
         bool rx_start_signal{};
-        bool tx_start_signal{};
-        bool rx_receive_operation_exited_due_to_error{};
+        std::atomic<bool> tx_start_signal{};
+        std::atomic<bool> rx_receive_operation_exited_due_to_error{};
         bool rx_stream_setup{};
         bool tx_stream_setup{};
         bool tx_stream_active{};
@@ -402,8 +403,11 @@ class SoapySidekiq : public SoapySDR::Device
 
         // RX buffer
         skiq_rx_block_t *p_rx_block[skiq_rx_hdl_end][DEFAULT_NUM_BUFFERS]{};
-        uint32_t rxReadIndex[skiq_rx_hdl_end]{};
-        uint32_t rxWriteIndex[skiq_rx_hdl_end]{};
+        // Ring indices shared by the receive thread (writer) and readStream()
+        // (reader).  Atomic so a block's contents are visible to the reader
+        // before the write index that publishes it, including on ARM targets.
+        std::atomic<uint32_t> rxReadIndex[skiq_rx_hdl_end]{};
+        std::atomic<uint32_t> rxWriteIndex[skiq_rx_hdl_end]{};
         bool rx_handle_enabled[skiq_rx_hdl_end]{};
         bool rx_first_block[skiq_rx_hdl_end]{};
         uint64_t rx_expected_timestamp[skiq_rx_hdl_end]{};

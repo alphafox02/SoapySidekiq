@@ -181,7 +181,7 @@ void SoapySidekiq::tx_streaming_start(void)
     SoapySDR_log(SOAPY_SDR_TRACE, "entering tx_streaming_start");
 
     // wait till called to start running
-    tx_cv.wait(lock, [this] { return tx_start_signal; });
+    tx_cv.wait(lock, [this] { return tx_start_signal.load(); });
 
     // this runs on its own thread, so report failures instead of throwing
     status = skiq_start_tx_streaming_on_1pps(card, tx_hdl, 0);
