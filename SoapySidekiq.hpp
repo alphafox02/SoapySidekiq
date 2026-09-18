@@ -258,6 +258,7 @@ class SoapySidekiq : public SoapySDR::Device
          * Sensor API
          ******************************************************************/
         std::vector<std::string> listSensors(void) const;
+        SoapySDR::ArgInfo getSensorInfo(const std::string &key) const override;
         std::string readSensor(const std::string &key) const;
 
         /*******************************************************************

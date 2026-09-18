@@ -2122,7 +2122,7 @@ void SoapySidekiq::setAntenna(const int direction,
         status = skiq_read_rx_rf_port_for_hdl(card, hdl, &current_port);
         if (status == 0 && current_port == requested_port)
         {
-            SoapySDR_logf(SOAPY_SDR_INFO,
+            SoapySDR_logf(SOAPY_SDR_DEBUG,
                           "RX channel %zu handle %s already uses RF port %s",
                           channel, rxHandleName(hdl), rfPortName(requested_port).c_str());
             return;
@@ -2185,7 +2185,7 @@ void SoapySidekiq::setAntenna(const int direction,
             throw std::runtime_error("failed to configure RX antenna");
         }
 
-        SoapySDR_logf(SOAPY_SDR_INFO,
+        SoapySDR_logf(SOAPY_SDR_DEBUG,
                       "RX channel %zu handle %s uses RF port %s",
                       channel, rxHandleName(hdl), rfPortName(requested_port).c_str());
     }
@@ -2225,7 +2225,7 @@ void SoapySidekiq::setAntenna(const int direction,
         status = skiq_read_tx_rf_port_for_hdl(card, hdl, &current_port);
         if (status == 0 && current_port == requested_port)
         {
-            SoapySDR_logf(SOAPY_SDR_INFO,
+            SoapySDR_logf(SOAPY_SDR_DEBUG,
                           "TX channel %zu handle %s already uses RF port %s",
                           channel, txHandleName(hdl), rfPortName(requested_port).c_str());
             return;
@@ -2288,7 +2288,7 @@ void SoapySidekiq::setAntenna(const int direction,
             throw std::runtime_error("failed to configure TX antenna");
         }
 
-        SoapySDR_logf(SOAPY_SDR_INFO,
+        SoapySDR_logf(SOAPY_SDR_DEBUG,
                       "TX channel %zu handle %s uses RF port %s",
                       channel, txHandleName(hdl), rfPortName(requested_port).c_str());
     }
@@ -2384,14 +2384,14 @@ bool SoapySidekiq::hasDCOffsetMode(const int direction,
 
         if ((mask & skiq_rx_cal_type_dc_offset) == skiq_rx_cal_type_dc_offset)
         {
-            SoapySDR_logf(SOAPY_SDR_INFO, "card: %u, handle %u, has DC Offest correction, " 
+            SoapySDR_logf(SOAPY_SDR_DEBUG, "card: %u, handle %u, has DC offset correction, " 
                           "mask is: %d",
                           card, hdl, mask);
             return true;
         }
         else
         {
-            SoapySDR_logf(SOAPY_SDR_INFO, "card: %u, handle %u, does not have DC Offest correction, " 
+            SoapySDR_logf(SOAPY_SDR_DEBUG, "card: %u, handle %u, does not have DC offset correction, " 
                           "mask is: %d",
                           card, hdl, mask);
             return false;
@@ -2440,7 +2440,7 @@ void SoapySidekiq::setDCOffsetMode(const int direction,
             throw std::runtime_error("");
         }
 
-        SoapySDR_logf(SOAPY_SDR_INFO, "channel: %u, setting DC offset correction to %s mode",
+        SoapySDR_logf(SOAPY_SDR_DEBUG, "channel: %u, setting DC offset correction to %s mode",
                       channel, (bool)cal_mode ? "automatic" : "manual");
     }
     else if (direction == SOAPY_SDR_TX)
@@ -2474,7 +2474,7 @@ bool SoapySidekiq::getDCOffsetMode(const int direction,
         throw std::runtime_error("");
         }
 
-        SoapySDR_logf(SOAPY_SDR_INFO, "Channel %d, DC offest mode is %s",
+        SoapySDR_logf(SOAPY_SDR_DEBUG, "Channel %d, DC offset mode is %s",
                       channel, (bool)cal_mode ? "automatic" : "manual");
     }
     else if (direction == SOAPY_SDR_TX)
@@ -2561,7 +2561,7 @@ void SoapySidekiq::setGainMode(const int direction, const size_t channel,
             throw std::runtime_error("");
         }
 
-        SoapySDR_logf(SOAPY_SDR_INFO, "card: %u, handle: %u, setting RX gain mode: %s",
+        SoapySDR_logf(SOAPY_SDR_DEBUG, "card: %u, handle: %u, setting RX gain mode: %s",
                       card, this->rx_hdl, automatic ? "skiq_rx_gain_auto" :
                       "skiq_rx_gain_manual");
     }
@@ -2595,7 +2595,7 @@ bool SoapySidekiq::getGainMode(const int direction, const size_t channel) const
                           card, status);
             throw std::runtime_error("");
         }
-        SoapySDR_logf(SOAPY_SDR_INFO, "card: %u, handle: %u, RX gain mode: is %s",
+        SoapySDR_logf(SOAPY_SDR_DEBUG, "card: %u, handle: %u, RX gain mode: is %s",
                       card, hdl, p_gain_mode ? "skiq_rx_gain_auto" :
                       "skiq_rx_gain_manual");
 
@@ -2703,7 +2703,7 @@ void SoapySidekiq::setGain(const int direction,
             throw std::runtime_error("");
         }
 
-        SoapySDR_logf(SOAPY_SDR_INFO,
+        SoapySDR_logf(SOAPY_SDR_DEBUG,
                       "card: %u, handle: %u, Setting TX attenuation: %.2f dB "
                       "(attenuation index: %u)",
                       card,
@@ -2814,7 +2814,7 @@ void SoapySidekiq::setGain(const int direction,
             return;
         }
 
-        SoapySDR_logf(SOAPY_SDR_INFO,
+        SoapySDR_logf(SOAPY_SDR_DEBUG,
             "card: %u, handle: %u, Set RX gain: requested %.2f dB, "
             "actual %.2f dB, gain index %u, index range [%u-%u]",
             card,
@@ -2893,7 +2893,7 @@ void SoapySidekiq::setGain(const int direction,
             throw std::runtime_error("");
         }
 
-        SoapySDR_logf(SOAPY_SDR_INFO,
+        SoapySDR_logf(SOAPY_SDR_DEBUG,
                       "card: %u, handle: %u, Setting TX output gain: %.2f dB "
                       "(actual attenuation %.2f dB, attenuation index: %u)",
                       card,
@@ -3118,7 +3118,7 @@ void SoapySidekiq::setFrequency(const int direction, const size_t channel,
         this->rx_center_frequency = requested_frequency;
         this->rx_center_frequency_by_handle[this->rx_hdl] = this->rx_center_frequency;
 
-        SoapySDR_logf(SOAPY_SDR_INFO, "Setting rx center freq: %lu on handle %u",
+        SoapySDR_logf(SOAPY_SDR_DEBUG, "Setting rx center freq: %lu on handle %u",
                       rx_center_frequency, this->rx_hdl);
 
         writeRxFrequency(this->rx_hdl, this->rx_center_frequency);
@@ -3132,7 +3132,7 @@ void SoapySidekiq::setFrequency(const int direction, const size_t channel,
 
         this->tx_center_frequency = requested_frequency;
 
-        SoapySDR_logf(SOAPY_SDR_INFO, "Setting tx center freq: %lu",
+        SoapySDR_logf(SOAPY_SDR_DEBUG, "Setting tx center freq: %lu",
                       tx_center_frequency);
 
         status = skiq_write_tx_LO_freq(this->card, this->tx_hdl, tx_center_frequency);
@@ -3470,7 +3470,7 @@ void SoapySidekiq::setSampleRate(const int direction, const size_t channel,
         }
 
         const uint32_t clamped = defaultBandwidthForPart(this->part, sample_rate);
-        SoapySDR_logf(SOAPY_SDR_INFO,
+        SoapySDR_logf(SOAPY_SDR_DEBUG,
                       "bandwidth %u Hz exceeds the new sample rate; using %u Hz",
                       bandwidth, clamped);
         return clamped;
@@ -3491,7 +3491,7 @@ void SoapySidekiq::setSampleRate(const int direction, const size_t channel,
         }
 
         writeRxSampleRateAndBandwidth(handles, requested_rate, requested_bandwidth);
-        SoapySDR_logf(SOAPY_SDR_INFO, "set rx sample rate on handle %s: %u",
+        SoapySDR_logf(SOAPY_SDR_DEBUG, "set rx sample rate on handle %s: %u",
                       rxHandleName(this->rx_hdl),
                       this->rx_sample_rate_by_handle[this->rx_hdl]);
     }
@@ -3502,7 +3502,7 @@ void SoapySidekiq::setSampleRate(const int direction, const size_t channel,
             bandwidthForRate(this->tx_bandwidth_by_handle[this->tx_hdl], requested_rate);
 
         writeTxSampleRateAndBandwidth(this->tx_hdl, requested_rate, requested_bandwidth);
-        SoapySDR_logf(SOAPY_SDR_INFO, "set tx sample rate on handle %s: %u",
+        SoapySDR_logf(SOAPY_SDR_DEBUG, "set tx sample rate on handle %s: %u",
                       txHandleName(this->tx_hdl),
                       this->tx_sample_rate_by_handle[this->tx_hdl]);
     }
@@ -3610,7 +3610,7 @@ void SoapySidekiq::setBandwidth(const int direction, const size_t channel,
                                            sample_rate);
 
         writeRxSampleRateAndBandwidth(handles, sample_rate, requested_bandwidth);
-        SoapySDR_logf(SOAPY_SDR_INFO, "set rx bandwidth on handle %s to %u",
+        SoapySDR_logf(SOAPY_SDR_DEBUG, "set rx bandwidth on handle %s to %u",
                       rxHandleName(this->rx_hdl),
                       this->rx_bandwidth_by_handle[this->rx_hdl]);
     }
@@ -3622,7 +3622,7 @@ void SoapySidekiq::setBandwidth(const int direction, const size_t channel,
         writeTxSampleRateAndBandwidth(this->tx_hdl,
                                       this->tx_sample_rate_by_handle[this->tx_hdl],
                                       requested_bandwidth);
-        SoapySDR_logf(SOAPY_SDR_INFO, "set tx bandwidth on handle %s to %u",
+        SoapySDR_logf(SOAPY_SDR_DEBUG, "set tx bandwidth on handle %s to %u",
                       txHandleName(this->tx_hdl),
                       this->tx_bandwidth_by_handle[this->tx_hdl]);
     }

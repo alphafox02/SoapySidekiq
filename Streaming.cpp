@@ -779,7 +779,7 @@ void SoapySidekiq::closeStream(SoapySDR::Stream *stream)
 
 size_t SoapySidekiq::getStreamMTU(SoapySDR::Stream *stream) const
 {
-    SoapySDR_logf(SOAPY_SDR_TRACE, "getStremMTU");
+    SoapySDR_logf(SOAPY_SDR_TRACE, "getStreamMTU");
 
     if (stream == RX_STREAM)
     {

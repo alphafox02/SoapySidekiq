@@ -11,6 +11,32 @@ std::vector<std::string> SoapySidekiq::listSensors(void) const
     return sensors;
 }
 
+SoapySDR::ArgInfo SoapySidekiq::getSensorInfo(const std::string &key) const
+{
+    SoapySDR::ArgInfo info;
+    info.key = key;
+
+    if (key == "temperature")
+    {
+        info.name = "Temperature";
+        info.description = "Sidekiq board temperature";
+        info.units = "C";
+        info.type = SoapySDR::ArgInfo::INT;
+    }
+    else if (key == "accelerometer")
+    {
+        info.name = "Accelerometer";
+        info.description = "Raw accelerometer axes as a JSON object {\"x\":..,\"y\":..,\"z\":..}";
+        info.type = SoapySDR::ArgInfo::STRING;
+    }
+    else
+    {
+        return SoapySDR::Device::getSensorInfo(key);
+    }
+
+    return info;
+}
+
 std::string SoapySidekiq::readSensor(const std::string &key) const
 {
     int status = 0;
@@ -26,6 +52,8 @@ std::string SoapySidekiq::readSensor(const std::string &key) const
             SoapySDR_logf(SOAPY_SDR_ERROR,
                           "Failure: skiq_read_temp (card %i), status %d", card,
                           status);
+            // no reading; do not report a made-up 0 C
+            return "";
         }
         else
         {
@@ -89,7 +117,7 @@ std::string SoapySidekiq::readSensor(const std::string &key) const
             return "{}";
         };
         std::stringstream ss;
-        ss << "{\"x\":" << x_data << " \"y\":" << y_data << " \"z\":" << z_data
+        ss << "{\"x\":" << x_data << ",\"y\":" << y_data << ",\"z\":" << z_data
            << "}";
 
         SoapySDR_logf(SOAPY_SDR_DEBUG, "accel data %s", (ss.str().c_str()));
