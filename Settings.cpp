@@ -1712,14 +1712,14 @@ SoapySidekiq::SoapySidekiq(const SoapySDR::Kwargs &args)
                   card, this->resolution, (uint32_t) this->maxValue);
 
     // allocate for # blocks
-    p_tx_status = static_cast<int32_t*>(calloc(DEFAULT_NUM_BUFFERS, sizeof(*p_tx_status)));
+    p_tx_status = static_cast<int32_t*>(calloc(DEFAULT_NUM_TX_BUFFERS, sizeof(*p_tx_status)));
     if (p_tx_status == NULL)
     {
         SoapySDR_logf(SOAPY_SDR_ERROR, "failed to allocate memory for TX status");
         throw std::runtime_error("");
     }
 
-    for (i = 0; i < DEFAULT_NUM_BUFFERS; i++)
+    for (i = 0; i < DEFAULT_NUM_TX_BUFFERS; i++)
     {
         p_tx_status[i] = 0;
     }

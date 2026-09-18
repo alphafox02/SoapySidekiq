@@ -7,6 +7,7 @@
 #include <mutex>
 #include <algorithm>
 #include <cmath>
+#include <ctime>
 #include <unordered_map>
 
 #include "SoapySidekiq.hpp"
@@ -612,7 +613,7 @@ SoapySDR::Stream *SoapySidekiq::setupStream(const int direction,
         tx_staging_buffer.resize(tx_bytes_per_sample * current_tx_block_size);
         tx_staging_fill = 0;
 
-        for (int i = 0; i < DEFAULT_NUM_BUFFERS; i++)
+        for (int i = 0; i < DEFAULT_NUM_TX_BUFFERS; i++)
         {
             p_tx_block[i] = skiq_tx_block_allocate(current_tx_block_size);
             if (p_tx_block[i] == NULL)
@@ -673,7 +674,7 @@ void SoapySidekiq::closeStream(SoapySDR::Stream *stream)
             deactivateStream(stream);
         }
 
-        for (int i = 0; i < DEFAULT_NUM_BUFFERS; i++)
+        for (int i = 0; i < DEFAULT_NUM_TX_BUFFERS; i++)
         {
             skiq_tx_block_free(p_tx_block[i]);
             p_tx_block[i] = NULL;
@@ -1305,6 +1306,25 @@ int SoapySidekiq::readStream(SoapySDR::Stream *stream,
     return samples_done;
 }
 
+void SoapySidekiq::waitForTxSpace(void)
+{
+    pthread_mutex_lock(&space_avail_mutex);
+    if (!space_avail)
+    {
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_nsec += 10 * 1000 * 1000;   // 10 ms
+        if (deadline.tv_nsec >= 1000000000L)
+        {
+            deadline.tv_sec += 1;
+            deadline.tv_nsec -= 1000000000L;
+        }
+        pthread_cond_timedwait(&space_avail_cond, &space_avail_mutex, &deadline);
+    }
+    space_avail = false;
+    pthread_mutex_unlock(&space_avail_mutex);
+}
+
 int SoapySidekiq::transmitBlock(const uint8_t *inbuff_ptr)
 {
     int status = 0;
@@ -1341,13 +1361,9 @@ int SoapySidekiq::transmitBlock(const uint8_t *inbuff_ptr)
         else
         {
             tx_buf_mutex.unlock();
-            pthread_mutex_lock(&space_avail_mutex);
-            // wait for a packet to complete
-            space_avail = false;
-            pthread_cond_wait(&space_avail_cond, &space_avail_mutex);
-            pthread_mutex_unlock(&space_avail_mutex);
-
-            // space available so try again
+            // wait for a packet to complete, then check again; the timeout
+            // covers a completion that lands before we start waiting
+            waitForTxSpace();
             continue;
         }
         tx_buf_mutex.unlock();
@@ -1368,15 +1384,7 @@ int SoapySidekiq::transmitBlock(const uint8_t *inbuff_ptr)
             tx_buf_mutex.unlock();
 
             // if there's no space left to send, wait until there should be space available
-            pthread_mutex_lock(&space_avail_mutex);
-
-            // wait for a packet to complete
-            while (!space_avail)
-            {
-                pthread_cond_wait(&space_avail_cond, &space_avail_mutex);
-            }
-            space_avail = false;
-            pthread_mutex_unlock(&space_avail_mutex);
+            waitForTxSpace();
         }
         else if (status != 0)
         {
@@ -1387,7 +1395,7 @@ int SoapySidekiq::transmitBlock(const uint8_t *inbuff_ptr)
         else
         {
             // move the index into the transmit block array
-            currTXBuffIndex = (currTXBuffIndex + 1) % DEFAULT_NUM_BUFFERS;
+            currTXBuffIndex = (currTXBuffIndex + 1) % DEFAULT_NUM_TX_BUFFERS;
             return 0;
         }
     }

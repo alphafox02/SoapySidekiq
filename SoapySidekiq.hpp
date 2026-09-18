@@ -22,6 +22,9 @@
 #define DEFAULT_BANDWIDTH (18000000)
 #define DEFAULT_FREQUENCY (1000000000)
 #define DEFAULT_NUM_BUFFERS (30000)
+// libsidekiq queues at most SKIQ_MAX_NUM_TX_QUEUED_PACKETS (50) TX packets, so
+// only a small ring is ever in flight; each block is block-size * 4 bytes.
+#define DEFAULT_NUM_TX_BUFFERS (256)
 #define DEFAULT_TX_BUFFER_LENGTH (16380)
 #define DEFAULT_SLEEP_US (1)
 #define SLEEP_1SEC (1 * 1000000)
@@ -418,7 +421,7 @@ class SoapySidekiq : public SoapySDR::Device
         long long rx_fifo_time_ns[skiq_rx_hdl_end]{};
 
         // TX buffer
-        skiq_tx_block_t *p_tx_block[DEFAULT_NUM_BUFFERS];
+        skiq_tx_block_t *p_tx_block[DEFAULT_NUM_TX_BUFFERS]{};
         uint32_t currTXBuffIndex{};
         uint32_t p_tx_block_index{};
         std::vector<uint8_t> tx_staging_buffer;
@@ -431,7 +434,7 @@ class SoapySidekiq : public SoapySDR::Device
             uint32_t txIndex;
         };
 
-        passedStruct tx_contexts[DEFAULT_NUM_BUFFERS]{};
+        passedStruct tx_contexts[DEFAULT_NUM_TX_BUFFERS]{};
 
 
         // TX callback static function
@@ -461,6 +464,7 @@ class SoapySidekiq : public SoapySDR::Device
         // calls its tx_enabled method.
         static void static_tx_enabled_callback(uint8_t card, int32_t status);
 
+        void waitForTxSpace(void);
         int transmitBlock(const uint8_t *data);
 
     public:
