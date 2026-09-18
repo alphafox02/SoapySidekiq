@@ -255,6 +255,7 @@ void SoapySidekiq::rx_receive_operation_impl(void)
                     SoapySDR_logf(SOAPY_SDR_WARNING,
                                   "RX ring buffer overrun on handle %u: client too slow, dropping half buffer",
                                   rcvd_hdl);
+                    rx_overflow_pending = true;
                     rxReadIndex[rcvd_hdl] =
                         (rxReadIndex[rcvd_hdl] + (DEFAULT_NUM_BUFFERS / 2)) %
                         DEFAULT_NUM_BUFFERS;
@@ -270,6 +271,7 @@ void SoapySidekiq::rx_receive_operation_impl(void)
                                      " in RX Sidekiq Thread");
                         SoapySDR_logf(SOAPY_SDR_DEBUG, "expected timestamp %lu, actual %lu",
                                       rx_expected_timestamp[rcvd_hdl], this_timestamp);
+                        rx_overflow_pending = true;
                         rx_first_block[rcvd_hdl] = true;
                     }
                 }
@@ -291,6 +293,7 @@ void SoapySidekiq::rx_receive_operation_impl(void)
         else if (status == skiq_rx_status_error_overrun)
         {
             SoapySDR_logf(SOAPY_SDR_WARNING, "overrun detected, (card %u)", card);
+            rx_overflow_pending = true;
         }
         else
         {
@@ -724,6 +727,7 @@ int SoapySidekiq::activateStream(SoapySDR::Stream *stream,
             return SOAPY_SDR_STREAM_ERROR;
         }
 
+        rx_overflow_pending = false;
         for (const auto handle : rx_stream_handles)
         {
             rxWriteIndex[handle] = 0;
@@ -1114,6 +1118,15 @@ int SoapySidekiq::readStream(SoapySDR::Stream *stream,
     if (stream != RX_STREAM) return SOAPY_SDR_NOT_SUPPORTED;
     if (rx_receive_operation_exited_due_to_error) return SOAPY_SDR_STREAM_ERROR;
     if (rx_stream_handles.empty()) return SOAPY_SDR_STREAM_ERROR;
+
+    // Samples were lost since the last read: report it once, as other Soapy
+    // drivers do, so the application knows the data is discontinuous.  The
+    // next read returns the samples that follow the gap.
+    if (rx_overflow_pending.exchange(false))
+    {
+        flags = 0;
+        return SOAPY_SDR_OVERFLOW;
+    }
 
     size_t samples_done = 0;
     bool timestamp_set = false;

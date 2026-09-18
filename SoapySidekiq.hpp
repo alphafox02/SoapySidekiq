@@ -358,6 +358,9 @@ class SoapySidekiq : public SoapySDR::Device
         bool rx_start_signal{};
         std::atomic<bool> tx_start_signal{};
         std::atomic<bool> rx_receive_operation_exited_due_to_error{};
+        // set by the receive thread when samples were lost; readStream()
+        // reports it once as SOAPY_SDR_OVERFLOW
+        std::atomic<bool> rx_overflow_pending{};
         bool rx_stream_setup{};
         bool tx_stream_setup{};
         bool tx_stream_active{};
