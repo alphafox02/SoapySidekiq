@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -33,6 +34,23 @@
 #define SOAPYSIDEKIQ_HAS_SDK_X40_PART 0
 #define SOAPYSIDEKIQ_HAS_SDK_NVM2_PART 0
 #endif
+
+// Topology management and the Matchstiq Z4 part types arrived in libsidekiq
+// v4.26.0.  Older SDKs still build; the topology device argument is ignored.
+#if defined(LIBSIDEKIQ_VERSION) && (LIBSIDEKIQ_VERSION >= 42600)
+#define SOAPYSIDEKIQ_HAS_SDK_TOPOLOGY 1
+#define SOAPYSIDEKIQ_HAS_SDK_Z4_PART 1
+#else
+#define SOAPYSIDEKIQ_HAS_SDK_TOPOLOGY 0
+#define SOAPYSIDEKIQ_HAS_SDK_Z4_PART 0
+#endif
+
+// Look up the RX/TX parameters for a handle.  skiq_param_t's rx_param[] and
+// tx_param[] arrays are indexed by channel, not by handle.
+const skiq_rx_param_t &rxParamForHandle(const skiq_param_t &param,
+                                        const skiq_rx_hdl_t handle);
+const skiq_tx_param_t &txParamForHandle(const skiq_param_t &param,
+                                        const skiq_tx_hdl_t handle);
 
 
 class SoapySidekiq : public SoapySDR::Device
@@ -280,6 +298,10 @@ class SoapySidekiq : public SoapySDR::Device
         skiq_rx_hdl_t rxHandleForChannel(const size_t channel) const;
         skiq_tx_hdl_t txHandleForChannel(const size_t channel) const;
         size_t mappedRxChannel(const size_t channel) const;
+        void applyTopology(const uint8_t topology_id);
+        void writeTxSampleRateAndBandwidth(const skiq_tx_hdl_t handle,
+                                           const uint32_t sample_rate,
+                                           const uint32_t bandwidth);
         void writeRxFrequency(const skiq_rx_hdl_t handle,
                               const uint64_t frequency);
         void writeRxSampleRateAndBandwidth(
@@ -300,6 +322,8 @@ class SoapySidekiq : public SoapySDR::Device
         uint8_t card{};
         std::basic_string<char> serial{};
         std::basic_string<char> timeSource{};
+        bool topology_applied{};
+        uint8_t topology_id{};
         uint32_t resolution{};
         double maxValue{};
         bool sidekiq_card_acquired{};
@@ -312,18 +336,27 @@ class SoapySidekiq : public SoapySDR::Device
                                        const skiq_xport_init_level_t level);
         static void releaseSidekiqCard(const uint8_t card);
 
+        // libsidekiq's TX-enabled callback only reports the card number, so
+        // each open device registers itself for its card.
+        static void registerInstance(const uint8_t card, SoapySidekiq *instance);
+        static void unregisterInstance(const uint8_t card, SoapySidekiq *instance);
+        static SoapySidekiq *getInstanceForCard(const uint8_t card);
+
         bool rxUseShort{};
         bool txUseShort{};
         uint32_t debug_ctr{};
 
         //  rx
         std::mutex rx_mutex;
-        std::condition_variable _cv;
+        std::condition_variable rx_cv;
         std::basic_string<char> timetype{};
         bool rx_running{};
         bool rx_start_signal{};
         bool tx_start_signal{};
         bool rx_receive_operation_exited_due_to_error{};
+        bool rx_stream_setup{};
+        bool tx_stream_setup{};
+        bool tx_stream_active{};
 
         bool rx_channel_alias_enabled{};
         size_t rx_channel_alias{};
@@ -331,8 +364,8 @@ class SoapySidekiq : public SoapySDR::Device
         skiq_rx_hdl_t rx_hdl{};
         uint64_t rx_center_frequency{};
         uint64_t rx_center_frequency_by_handle[skiq_rx_hdl_end]{};
-        uint32_t rx_sample_rate{};
-        uint32_t rx_bandwidth{};
+        uint32_t rx_sample_rate_by_handle[skiq_rx_hdl_end]{};
+        uint32_t rx_bandwidth_by_handle[skiq_rx_hdl_end]{};
         uint32_t rx_block_size_in_words{};
         uint32_t rx_block_size_in_bytes{};
         uint32_t rx_payload_size_in_bytes{};
@@ -341,6 +374,7 @@ class SoapySidekiq : public SoapySDR::Device
 
         //  tx
         std::mutex tx_mutex;
+        std::condition_variable tx_cv;
         std::mutex tx_buf_mutex;
         pthread_mutex_t tx_enabled_mutex;
         pthread_cond_t tx_enabled_cond;
@@ -353,8 +387,8 @@ class SoapySidekiq : public SoapySDR::Device
         uint8_t  num_tx_channels{};
         skiq_tx_hdl_t tx_hdl{};
         uint64_t tx_center_frequency{};
-        uint32_t tx_sample_rate{};
-        uint32_t tx_bandwidth{};
+        uint32_t tx_sample_rate_by_handle[skiq_tx_hdl_end]{};
+        uint32_t tx_bandwidth_by_handle[skiq_tx_hdl_end]{};
         uint32_t tx_underruns{};
         uint32_t complete_count{};
         uint32_t current_tx_block_size{};
@@ -420,31 +454,26 @@ class SoapySidekiq : public SoapySDR::Device
         // TX enabled callback static function
         // The registration requires a static function instead of a method so
         // this must be created to be able to register it.
-        // This function calls the tx_enabled method.
-        static void static_tx_enabled_callback(uint8_t card, int32_t status) 
-        {
-            // the structure contains the SoapySidekiq instance and the index of the block
-            // that was transmitted
-            SoapySidekiq *self = thisClassAddr;
-
-            // Call the member function
-            self->tx_enabled(card, status);
-        }
-
-        static SoapySidekiq *thisClassAddr;
+        // This function looks up the instance registered for the card and
+        // calls its tx_enabled method.
+        static void static_tx_enabled_callback(uint8_t card, int32_t status);
 
         int transmitBlock(const uint8_t *data);
 
     public:
+        // Serializes libsidekiq calls that are not thread safe (library
+        // init/exit, card enable/disable, discovery, logging registration).
+        // SoapySDR may open or enumerate several devices in parallel.
+        static std::mutex &libraryMutex(void) { return sidekiq_init_mutex; }
+
         //  receive thread
         std::thread _rx_receive_thread;
         void rx_receive_operation(void);
         void rx_receive_operation_impl(void);
-        static std::vector<SoapySDR::Kwargs> sidekiq_devices;
 
         // tx thread
         std::thread _tx_streaming_thread;
-        void tx_streaming_start();
+        void tx_streaming_start(void);
 
         // tx callback method
         void tx_complete(int32_t status, skiq_tx_block_t *p_data, uint32_t txIndex);

@@ -90,19 +90,19 @@ def analyze_blocks(buff, rx_stream, N, fullscale):
 ############################################################################################
 # Receive Signal
 ############################################################################################
-def main(cardno, rx_handle, rate, bw, freq):
+def main(cardno, topology, rx_handle, rate, bw, freq):
     global running, sdr, rx_stream
 
-    args = dict(card = cardno)
-    #    args = dict(serial = '8N55')
+    args = dict(driver="sidekiq", card=cardno)
+    if topology:
+        args["topology"] = topology
 
     SoapySDR.setLogLevel(SOAPY_SDR_WARNING)
 
     sdr = SoapySDR.Device(args)
 
     # get the full scale value for this card
-    rc = sdr.getNativeStreamFormat(SOAPY_SDR_RX, rx_handle)
-    fullscale = int(rc.fullScale)
+    fullscale = int(sdr.readSetting("full_scale"))
     SoapySDR.log(SoapySDR.SOAPY_SDR_INFO, f"RX fullscale value: {fullscale:,}")
 
     # set the radio to use FPGA counter mode
@@ -184,6 +184,8 @@ def parse_command_line_arguments():
                                      formatter_class=help_formatter)
     parser.add_argument('-c', required=False, dest='card',
                         default='0', help=' Card')
+    parser.add_argument('--topology', required=False, dest='topology',
+                        default=None, help='Topology ID')
     parser.add_argument('-handle', type=int, required=False, dest='handle',
                         default=0, help=' Channel')
     parser.add_argument('-r', type=float, required=False, dest='rate',
@@ -209,5 +211,4 @@ if __name__ == '__main__':
     print("sample rate (-s)\t:", pars.rate/1000000, "M","\t\tbandwidth (-bw)\t\t:", pars.bw/1000000, "M")
     print("freq (-f)\t:", pars.freq/1000000)
 
-    main(pars.card, pars.handle, pars.rate, pars.bw, pars.freq)
-
+    main(pars.card, pars.topology, pars.handle, pars.rate, pars.bw, pars.freq)

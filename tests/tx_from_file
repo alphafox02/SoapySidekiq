@@ -41,19 +41,21 @@ def read_binary_file_into_buffers(file_path, buffer_size, num_buffers):
 
     return buffers
 
-def main(cardno=0, serial=None, handle=0, 
+def main(cardno=0, serial=None, topology=None, handle=0, 
          rate=20e6, bw=None, freq=1e7, 
          attenuation=100, make_float=False, offset=None):
 
     if serial is None:
-        args = dict(card = cardno)
+        args = dict(driver="sidekiq", card=cardno)
     else:
-        args = dict(serial = '8N55')
+        args = dict(driver="sidekiq", serial=serial)
+
+    if topology:
+        args["topology"] = topology
 
     sdr = SoapySDR.Device(args)
 
     SoapySDR.setLogLevel(SOAPY_SDR_TRACE)
-#    SoapySDR.setLogLevel(SOAPY_SDR_ERROR)
 
     if (make_float):
         tx_stream = sdr.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, [handle])
@@ -99,7 +101,7 @@ def main(cardno=0, serial=None, handle=0,
                 rc = sdr.writeStream(tx_stream, [tx_buff[idx]], buffer_size_words)
                 if rc.ret != buffer_size_words:
                     SoapySDR.log(SoapySDR.SOAPY_SDR_ERROR, 'TX Error {}: {}'.format(rc.ret, 
-                                                    errToStr(rc.ret)))
+                                                    SoapySDR.errToStr(rc.ret)))
 
                 total_samps += buffer_size_words
 
@@ -125,6 +127,8 @@ def parse_command_line_arguments():
                         default="0", help='Card number') 
     parser.add_argument('--serial', required=False, dest='serial',
                         default=None, help='Serial number') 
+    parser.add_argument('--topology', required=False, dest='topology',
+                        default=None, help='Topology ID')
     parser.add_argument('--handle', type=int, required=False, dest='handle',
                         default=0, help='Handle [0 or 1]')
     parser.add_argument('-r', type=float, required=False, dest='rate',
@@ -148,6 +152,7 @@ if __name__ == '__main__':
 
     main(pars.card, 
         pars.serial, 
+        pars.topology,
         pars.handle, 
         pars.rate, 
         pars.bw, 

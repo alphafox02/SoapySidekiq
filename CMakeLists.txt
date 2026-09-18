@@ -22,12 +22,24 @@ if (NOT SoapySDR_FOUND)
     message(FATAL_ERROR "Soapy SDR development files not found...")
 endif ()
 
+set(SIDEKIQ_SDK_DIR "" CACHE PATH
+    "Path to the Sidekiq SDK (default: $SIDEKIQ_SDK_DIR, $Sidekiq_DIR, or ~/sidekiq_sdk_current)")
+
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR})
 find_package(Sidekiq)
 
 if (NOT Sidekiq_FOUND)
-    message(FATAL_ERROR "Sidekiq development files not found...")
+    message(FATAL_ERROR
+        "Sidekiq development files not found.  "
+        "The SDK location can be specified with "
+        "-DSIDEKIQ_SDK_DIR=/path/to/sidekiq_sdk_current")
 endif ()
+message(STATUS "SIDEKIQ_SDK_DIR - ${SIDEKIQ_SDK_DIR}")
+if (Sidekiq_VERSION)
+    message(STATUS "Sidekiq_VERSION - ${Sidekiq_VERSION}")
+    message(STATUS "Sidekiq_BUILD_CONFIG - ${Sidekiq_BUILD_CONFIG}")
+endif ()
+message(STATUS "Sidekiq_PKG_LIBRARY_DIRS - ${Sidekiq_PKG_LIBRARY_DIRS}")
 message(STATUS "Sidekiq_INCLUDE_DIRS - ${Sidekiq_INCLUDE_DIRS}")
 message(STATUS "Sidekiq_LIBRARIES - ${Sidekiq_LIBRARIES}")
 message(STATUS "OTHER_LIBS - ${OTHER_LIBS}")

@@ -24,15 +24,37 @@ driver=sidekiq
 For G20/G40 targets, build SoapySDR from source unless the target OS packages
 provide the SoapySDR ABI you intend to use.
 
-If the Sidekiq SDK is not installed in a standard location, set `Sidekiq_DIR`
-or pass `-DSidekiq_ROOT=/path/to/sidekiq_sdk_current` when configuring CMake.
+### Sidekiq SDK versions
+
+SDK v4.26.0 and newer ship a `sidekiq-config` tool, which the build uses to
+pick the right library and support libraries for the platform. Older SDKs are
+still supported: when `sidekiq-config` is not present, the build falls back to
+locating the library for the host platform directly (pass `-DPLATFORM=...` for
+cross-platform SDK flavors such as `msiq-g20g40`).
+
+Features that need a newer SDK are enabled at compile time based on the SDK
+headers. Topology selection and the Matchstiq Z4 need SDK v4.26.0 or newer;
+with an older SDK the `topology` device argument is accepted but ignored with
+a warning.
+
+### Locating the SDK
+
+The build looks for the SDK in this order:
+
+1. `-DSIDEKIQ_SDK_DIR=/path/to/sidekiq_sdk_current`
+2. `SIDEKIQ_SDK_DIR` from the environment
+3. `Sidekiq_DIR` from the environment (older name, still honored)
+4. `$HOME/sidekiq_sdk_current`
+
+Pass `-DSIDEKIQ_USE_SIDEKIQ_CONFIG=OFF` to skip `sidekiq-config` and use the
+direct library search even with a newer SDK.
 
 ## Build And Install
 
 Build from the SoapySidekiq checkout you intend to use.
 
 ```bash
-export Sidekiq_DIR=$HOME/sidekiq_sdk_current
+export SIDEKIQ_SDK_DIR=$HOME/sidekiq_sdk_current
 export LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/epiq:${LD_LIBRARY_PATH}
 
 cmake -S . -B build \
@@ -48,7 +70,7 @@ For a G20/G40 target:
 ```bash
 cmake -S . -B build \
   -DPLATFORM=msiq-g20g40 \
-  -DSidekiq_ROOT=/home/sidekiq/sidekiq_sdk_current \
+  -DSIDEKIQ_SDK_DIR=/home/sidekiq/sidekiq_sdk_current \
   -DCMAKE_PREFIX_PATH=/usr/local \
   -DCMAKE_BUILD_TYPE=Release
 ```
@@ -93,6 +115,20 @@ Soapy channel numbers select Sidekiq RX handles. Soapy antenna names select RF
 ports for the chosen handle. Use `SoapySDRUtil --probe` to inspect the mapping
 reported by the installed card, FPGA image, and `libsidekiq` runtime.
 
+### Topologies (Matchstiq Z4)
+
+Cards that support topologies (SDK v4.26.0 or newer) can be opened with a
+topology ID, which is applied before the channel mapping is read:
+
+```text
+driver=sidekiq,card=0,topology=1
+```
+
+On cards without topology support the argument is ignored with a warning. The
+active topology can be read back with `readSetting("topology")`; it reports the
+topology ID, `none`, or `unsupported`. The test scripts in `tests/` accept a
+`--topology` option.
+
 ## Streaming And Controls
 
 RX supports `CS16` and `CF32` streams. TX accepts `CS16` and `CF32`, with
@@ -110,6 +146,9 @@ Sample rates and bandwidths are reported through the Soapy range and list APIs.
 On profile-based radios such as NV100/NVM2, the broad min/max range does not
 mean every value in the range is a valid RFIC profile. Use `SoapySDRUtil
 --probe` or `build/range_smoke --cards 0` to inspect concrete choices.
+
+The read-only `full_scale` setting reports the card's full-scale integer sample
+value (for example 2047 for a 12-bit card), for scaling `CS16` samples.
 
 RX gain maps to the Sidekiq RX gain table. TX output power is controlled by
 Sidekiq attenuation. The aggregate Soapy TX `setGain()` call uses gain-style
@@ -170,6 +209,12 @@ FPGA image, and `libsidekiq` runtime.
   libsidekiq card lock.
 - If changing sample rate or bandwidth fails on NV100/NVM2, use one of the
   listed RFIC profile rates and a compatible bandwidth.
+- If a warning reports that the actual sample rate or bandwidth differs from
+  the requested value, the RFIC could not produce the exact request; the
+  warning shows the value the hardware is using.
+- On products where 1PPS source selection has moved to the
+  `epiq-axi-timing` kernel driver, the time source is read and written through
+  `/sys/kernel/epiq-axi-timing/pps/source` when the libsidekiq calls fail.
 
 ## License And Attribution
 

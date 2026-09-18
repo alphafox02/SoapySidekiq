@@ -90,7 +90,7 @@ std::string SoapySidekiq::readSensor(const std::string &key) const
         };
         std::stringstream ss;
         ss << "{\"x\":" << x_data << " \"y\":" << y_data << " \"z\":" << z_data
-           << "}";   
+           << "}";
 
         SoapySDR_logf(SOAPY_SDR_DEBUG, "accel data %s", (ss.str().c_str()));
         return ss.str();

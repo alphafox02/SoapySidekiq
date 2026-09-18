@@ -1,6 +1,7 @@
 //  Copyright [2018] <Alexander Hurd>"
 
 #include "SoapySidekiq.hpp"
+#include <mutex>
 #include <SoapySDR/Registry.hpp>
 #include <array>
 #include <iostream>
@@ -206,13 +207,17 @@ static std::vector<SoapySDR::Kwargs> findSidekiq(const SoapySDR::Kwargs &args)
 
     SoapySDR_logf(SOAPY_SDR_TRACE, "findSidekiq");
 
+    // SoapySDR may enumerate from several threads at once (e.g. when opening
+    // a list of devices); libsidekiq's discovery calls are not thread safe.
+    std::lock_guard<std::mutex> lock(SoapySidekiq::libraryMutex());
+
     uint8_t           number_of_cards = 0;
     uint8_t           card_list[SKIQ_MAX_NUM_CARDS];
     char *            serial_str = nullptr;
     pid_t             card_owner;
     skiq_xport_type_t type = skiq_xport_type_auto;
 
-    SoapySidekiq::sidekiq_devices.clear();
+    std::vector<SoapySDR::Kwargs> devices;
 
     /* query the list of all Sidekiq cards on the PCIe interface */
     status = skiq_get_cards(type, &number_of_cards, card_list);
@@ -242,7 +247,7 @@ static std::vector<SoapySDR::Kwargs> findSidekiq(const SoapySDR::Kwargs &args)
 
         deviceAvailable =
             (card_owner == getpid());   // owner must be this process(pid)
-                                        
+
         if (!deviceAvailable)
         {
             SoapySDR_logf(SOAPY_SDR_WARNING,
@@ -274,13 +279,13 @@ static std::vector<SoapySDR::Kwargs> findSidekiq(const SoapySDR::Kwargs &args)
             devInfo["part_revision"] = part.revision;
             devInfo["part_variant"] = part.variant;
         }
-        SoapySidekiq::sidekiq_devices.push_back(devInfo);
+        devices.push_back(devInfo);
 
         const std::vector<DiscoveryAlias> aliases =
             foundPart ? discoveryAliasesForPart(part) : std::vector<DiscoveryAlias>();
         if (args.count("channel") != 0 || args.count("rx_channel") != 0)
         {
-            addRequestedChannelInfo(SoapySidekiq::sidekiq_devices,
+            addRequestedChannelInfo(devices,
                                     args,
                                     devInfo,
                                     deviceLabel,
@@ -288,7 +293,7 @@ static std::vector<SoapySDR::Kwargs> findSidekiq(const SoapySDR::Kwargs &args)
         }
         else if (args.count("card") == 0 && args.count("serial") == 0)
         {
-            addKnownChannelInfos(SoapySidekiq::sidekiq_devices,
+            addKnownChannelInfos(devices,
                                  devInfo,
                                  deviceLabel,
                                  aliases);
@@ -296,7 +301,7 @@ static std::vector<SoapySDR::Kwargs> findSidekiq(const SoapySDR::Kwargs &args)
     }
 
     //  filtering
-    for (const auto &devInfo : SoapySidekiq::sidekiq_devices)
+    for (const auto &devInfo : devices)
     {
         if (!matchesDiscoveryFilter(args, devInfo))
         {

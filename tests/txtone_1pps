@@ -40,25 +40,28 @@ def make_tone(n, make_float, fcen, fs, max_value, phi=0.285):
         return sig_int16
 
 
-def main(cardno, serial, handle, 
+def main(cardno, serial, topology, handle, 
+         tx_block_size,
          rate, bw, freq, 
          attenuation, make_float, offset):
 
     SoapySDR.setLogLevel(SOAPY_SDR_TRACE)
 
+    args = {"driver": "sidekiq", "tx_block_size": tx_block_size}
     if serial is None:
-        sdr = SoapySDR.Device({"card": cardno,
-                               "tx_block_size": "16380"})
+        args["card"] = cardno
     else:
-        sdr = SoapySDR.Device({"serial": serial,
-                               "tx_block_size": "16380"})
+        args["serial"] = serial
+
+    if topology:
+        args["topology"] = topology
+
+    sdr = SoapySDR.Device(args)
 
     SoapySDR.setLogLevel(SOAPY_SDR_TRACE)
-#    SoapySDR.setLogLevel(SOAPY_SDR_ERROR)
 
     # get the full scale value for making the tone.
-    rc = sdr.getNativeStreamFormat(SOAPY_SDR_TX, handle)
-    fullscale = int(rc.fullScale)
+    fullscale = int(sdr.readSetting("full_scale"))
     SoapySDR.log(SoapySDR.SOAPY_SDR_INFO, f"TX fullscale value: {fullscale:,}")
 
     if (make_float):
@@ -108,7 +111,7 @@ def main(cardno, serial, handle,
             rc = sdr.writeStream(tx_stream, [tx_buff], buff_len)
             if rc.ret != buff_len:
                 SoapySDR.log(SoapySDR.SOAPY_SDR_ERROR, 
-                             'TX Error {}: {}'.format(rc.ret, errToStr(rc.ret)))
+                             'TX Error {}: {}'.format(rc.ret, SoapySDR.errToStr(rc.ret)))
         except KeyboardInterrupt:
             break
 
@@ -136,8 +139,12 @@ def parse_command_line_arguments():
                         default="0", help='Card number') 
     parser.add_argument('--serial', required=False, dest='serial',
                         default=None, help='Serial number') 
+    parser.add_argument('--topology', required=False, dest='topology',
+                        default=None, help='Topology ID')
     parser.add_argument('--handle', type=int, required=False, dest='handle',
                         default=0, help='Handle [0 or 1]')
+    parser.add_argument('--tx-block-size', required=False, dest='tx_block_size',
+                        default="16380", help='Tx block size in words')
     parser.add_argument('-r', type=float, required=False, dest='rate',
                         default=40e6, help='Sample Rate')
     parser.add_argument('-bw', type=float, required=False, dest='bw',
@@ -161,7 +168,9 @@ if __name__ == '__main__':
 
     main(pars.card, 
         pars.serial, 
+        pars.topology,
         pars.handle, 
+        pars.tx_block_size,
         pars.rate, 
         pars.bw, 
         pars.freq, 

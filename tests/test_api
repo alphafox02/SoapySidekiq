@@ -280,13 +280,14 @@ def do_time(sdr, handle):
     print(f"\t{source}") 
 
     print("setTimeSource")
-    sdr.setTimeSource("1pps_source_external")
-    source = sdr.getTimeSource()
-    print(f"\t{source}") 
-
-    sdr.setTimeSource("1pps_source_internal")
-    source = sdr.getTimeSource()
-    print(f"\t{source}") 
+    # Might fail if not present
+    for requested_source in ("1pps_source_external", "1pps_source_internal"):
+        try:
+            sdr.setTimeSource(requested_source)
+            source = sdr.getTimeSource()
+            print(f"\t{source}")
+        except RuntimeError as ex:
+            print(f"\tskipping {requested_source}: {ex}")
 
     # cannot set source to unavailable
 
@@ -351,14 +352,16 @@ def do_sensors(sdr, handle):
         sdr.readSensor(source)
 
 
-def main(cardno, serial, handle, rate, bw, freq, gain, num_blocks, file_name):
+def main(cardno, serial, topology, handle, rate, bw, freq, gain, num_blocks, file_name):
     if serial is None:
-        args = dict(card = cardno)
+        args = dict(driver="sidekiq", card=cardno)
     else:
-        args = dict(serial = '8N55')
+        args = dict(driver="sidekiq", serial=serial)
+
+    if topology:
+        args['topology'] = topology
 
     SoapySDR.setLogLevel(SOAPY_SDR_TRACE)
-#    SoapySDR.setLogLevel(SOAPY_SDR_ERROR)
     sdr = SoapySDR.Device(args)
 
 
@@ -373,10 +376,6 @@ def main(cardno, serial, handle, rate, bw, freq, gain, num_blocks, file_name):
     num_tx_channels = sdr.getNumChannels(SOAPY_SDR_TX)
 
     print(f"\tnum tx channels: {num_tx_channels}")
-
-    # invalid test passed so comment out for now.
-#    num_tx_channels = sdr.getNumChannels(5)
-
 
     user_input = input("Press any key to continue")
     #  *** Sample Rate API
@@ -428,6 +427,8 @@ def parse_command_line_arguments():
                         default="0", help='Card number') 
     parser.add_argument('--serial', required=False, dest='serial',
                         default=None, help='Serial number') 
+    parser.add_argument('--topology', required=False, dest='topology',
+                        default=None, help='Topology ID')
     parser.add_argument('--handle', type=int, required=False, dest='handle',
                         default=0, help='Handle [0 or 1]')
     parser.add_argument('-r', type=float, required=False, dest='rate',
@@ -454,6 +455,7 @@ if __name__ == '__main__':
 
     main(pars.card, 
         pars.serial, 
+        pars.topology,
         pars.handle, 
         pars.rate, 
         pars.bw, 
