@@ -416,7 +416,6 @@ class SoapySidekiq : public SoapySDR::Device
         std::vector<int16_t> rx_fifo_buffer[skiq_rx_hdl_end];
         size_t rx_fifo_offset[skiq_rx_hdl_end]{};
         long long rx_fifo_time_ns[skiq_rx_hdl_end]{};
-        long long rx_fifo_time_step_ns{};
 
         // TX buffer
         skiq_tx_block_t *p_tx_block[DEFAULT_NUM_BUFFERS];

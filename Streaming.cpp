@@ -6,6 +6,7 @@
 #include <thread>
 #include <mutex>
 #include <algorithm>
+#include <cmath>
 #include <unordered_map>
 
 #include "SoapySidekiq.hpp"
@@ -500,8 +501,6 @@ SoapySDR::Stream *SoapySidekiq::setupStream(const int direction,
             throw std::runtime_error("");
         }
         SoapySDR_logf(SOAPY_SDR_INFO, "System Timestamp Freq: %llu", this->sys_freq);
-        rx_fifo_time_step_ns = static_cast<long long>(
-            NANOS_IN_SEC / rx_sample_rate_by_handle[first_handle]);
 
         /* set rx sample order */
         if (iq_swap == true)
@@ -1127,6 +1126,20 @@ int SoapySidekiq::readStream(SoapySDR::Stream *stream,
         return convert_timestamp_to_nanos(block_ptr->sys_timestamp, sys_freq);
     };
 
+    // time spanned by a number of samples at the handle's current rate; kept
+    // in floating point so rates like 30.72 MS/s do not accumulate truncation
+    auto samples_to_ns = [this](const skiq_rx_hdl_t handle,
+                                const size_t samples) -> long long
+    {
+        const uint32_t rate = rx_sample_rate_by_handle[handle];
+        if (rate == 0)
+        {
+            return 0;
+        }
+        return static_cast<long long>(
+            std::llround(static_cast<double>(samples) * 1e9 / rate));
+    };
+
     auto available_samples = [this](const skiq_rx_hdl_t handle) -> size_t
     {
         const size_t fifo_left =
@@ -1144,7 +1157,8 @@ int SoapySidekiq::readStream(SoapySDR::Stream *stream,
         return 0;
     };
 
-    auto copy_samples = [this, &block_time_ns, &timestamp_set, &timeNs, &flags](
+    auto copy_samples = [this, &block_time_ns, &samples_to_ns,
+                         &timestamp_set, &timeNs, &flags](
         const skiq_rx_hdl_t handle,
         void *output_buf,
         const size_t output_offset,
@@ -1159,8 +1173,7 @@ int SoapySidekiq::readStream(SoapySDR::Stream *stream,
             if (timestamps_from_this_handle && !timestamp_set)
             {
                 timeNs = rx_fifo_time_ns[handle] +
-                         static_cast<long long>(rx_fifo_offset[handle]) *
-                             rx_fifo_time_step_ns;
+                         samples_to_ns(handle, rx_fifo_offset[handle]);
                 flags = SOAPY_SDR_HAS_TIME;
                 timestamp_set = true;
             }
@@ -1239,8 +1252,7 @@ int SoapySidekiq::readStream(SoapySDR::Stream *stream,
             }
             rx_fifo_offset[handle] = 0;
             rx_fifo_time_ns[handle] =
-                block_time_ns(block_ptr) +
-                static_cast<long long>(count) * rx_fifo_time_step_ns;
+                block_time_ns(block_ptr) + samples_to_ns(handle, count);
         }
 
         rxReadIndex[handle] = (rxReadIndex[handle] + 1) % DEFAULT_NUM_BUFFERS;
