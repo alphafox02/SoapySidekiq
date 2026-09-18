@@ -6,8 +6,10 @@
 #include <thread>
 #include <mutex>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <ctime>
+#include <new>
 #include <unordered_map>
 
 #include "SoapySidekiq.hpp"
@@ -102,6 +104,59 @@ double SoapySidekiq::nativeFullScale(const int direction, const size_t channel) 
     return 32767.0;
 }
 
+uint32_t SoapySidekiq::rxRingBlocksForRate(const uint32_t sample_rate) const
+{
+    if (rx_payload_size_in_words == 0)
+    {
+        return MIN_RX_RING_BLOCKS;
+    }
+
+    const double samples = static_cast<double>(sample_rate) * rx_buffer_ms / 1000.0;
+    const double blocks = std::ceil(samples / rx_payload_size_in_words);
+    return static_cast<uint32_t>(
+        std::max<double>(MIN_RX_RING_BLOCKS, std::min<double>(MAX_RX_RING_BLOCKS, blocks)));
+}
+
+void SoapySidekiq::allocateRxRings(void)
+{
+    const uint32_t sample_rate = rx_sample_rate_by_handle[rx_stream_handles.front()];
+    const uint32_t blocks = rxRingBlocksForRate(sample_rate);
+
+    // keep every block 8-byte aligned for the 64-bit timestamps in its header
+    rx_ring_stride = (static_cast<size_t>(rx_block_size_in_bytes) + 7u) & ~static_cast<size_t>(7u);
+
+    for (int h = 0; h < skiq_rx_hdl_end; h++)
+    {
+        rx_ring_storage[h].reset();
+    }
+    rx_ring_blocks = 0;
+
+    for (const auto handle : rx_stream_handles)
+    {
+        // left uninitialized: every block is written before it is read, and
+        // untouched pages do not become resident
+        rx_ring_storage[handle].reset(new (std::nothrow) uint8_t[blocks * rx_ring_stride]);
+        if (!rx_ring_storage[handle])
+        {
+            for (int h = 0; h < skiq_rx_hdl_end; h++)
+            {
+                rx_ring_storage[h].reset();
+            }
+            throw std::runtime_error("failed to allocate " +
+                                     std::to_string(blocks * rx_ring_stride / (1024 * 1024)) +
+                                     " MB for the RX buffer; lower the buffer_ms stream argument");
+        }
+    }
+    rx_ring_blocks = blocks;
+
+    SoapySDR_logf(SOAPY_SDR_INFO,
+                  "RX buffer: %u blocks per channel (%.0f ms at %u S/s, %.1f MB per channel)",
+                  blocks,
+                  1000.0 * blocks * rx_payload_size_in_words / (sample_rate ? sample_rate : 1),
+                  sample_rate,
+                  blocks * rx_ring_stride / (1024.0 * 1024.0));
+}
+
 long long SoapySidekiq::convert_timestamp_to_nanos(
         const uint64_t timestamp, const uint64_t timestamp_freq) const
 {
@@ -158,6 +213,16 @@ SoapySDR::ArgInfoList SoapySidekiq::getStreamArgsInfo(
         bufflenArg.value       = std::to_string(rx_payload_size_in_words);
 
         streamArgs.push_back(bufflenArg);
+
+        SoapySDR::ArgInfo bufferArg;
+        bufferArg.key         = "buffer_ms";
+        bufferArg.name        = "Receive Buffer";
+        bufferArg.description = "Time the driver buffers per channel for slow readers, "
+                                "at the stream's sample rate.";
+        bufferArg.units       = "ms";
+        bufferArg.type        = SoapySDR::ArgInfo::FLOAT;
+        bufferArg.value       = std::to_string(static_cast<int>(DEFAULT_RX_BUFFER_MS));
+        streamArgs.push_back(bufferArg);
     }
     else
     {
@@ -248,19 +313,6 @@ void SoapySidekiq::rx_receive_operation_impl(void)
                     throw std::runtime_error("");
                 }
 
-                // --- Overrun detection: if buffer full, drop half ---
-                uint32_t nextWrite = (rxWriteIndex[rcvd_hdl] + 1) % DEFAULT_NUM_BUFFERS;
-                if (nextWrite == rxReadIndex[rcvd_hdl])
-                {
-                    SoapySDR_logf(SOAPY_SDR_WARNING,
-                                  "RX ring buffer overrun on handle %u: client too slow, dropping half buffer",
-                                  rcvd_hdl);
-                    rx_overflow_pending = true;
-                    rxReadIndex[rcvd_hdl] =
-                        (rxReadIndex[rcvd_hdl] + (DEFAULT_NUM_BUFFERS / 2)) %
-                        DEFAULT_NUM_BUFFERS;
-                }
-
                 uint64_t this_timestamp = tmp_p_rx_block->rf_timestamp;
                 if (!rx_first_block[rcvd_hdl])
                 {
@@ -271,7 +323,6 @@ void SoapySidekiq::rx_receive_operation_impl(void)
                                      " in RX Sidekiq Thread");
                         SoapySDR_logf(SOAPY_SDR_DEBUG, "expected timestamp %lu, actual %lu",
                                       rx_expected_timestamp[rcvd_hdl], this_timestamp);
-                        rx_overflow_pending = true;
                         rx_first_block[rcvd_hdl] = true;
                     }
                 }
@@ -282,18 +333,45 @@ void SoapySidekiq::rx_receive_operation_impl(void)
                 rx_expected_timestamp[rcvd_hdl] =
                     this_timestamp + rx_payload_size_in_words;
 
-                // Copy into RAM ring buffer
-                memcpy(p_rx_block[rcvd_hdl][rxWriteIndex[rcvd_hdl]],
+                // Single-producer/single-consumer ring: this thread only
+                // advances the write index.  If the reader has fallen a full
+                // ring behind, drop the incoming block and let readStream()
+                // catch up; never touch a block the reader may be copying.
+                const uint32_t write_index = rxWriteIndex[rcvd_hdl];
+                const uint32_t next_write = (write_index + 1) % rx_ring_blocks;
+                if (next_write == rxReadIndex[rcvd_hdl])
+                {
+                    if (!rx_ring_dropping[rcvd_hdl])
+                    {
+                        SoapySDR_logf(SOAPY_SDR_WARNING,
+                                      "RX buffer full on handle %u: the application is "
+                                      "reading too slowly, dropping samples",
+                                      rcvd_hdl);
+                        rx_ring_dropping[rcvd_hdl] = true;
+                    }
+                    rx_ring_dropped[rcvd_hdl]++;
+                    rx_ring_overrun = true;
+                    continue;
+                }
+                if (rx_ring_dropping[rcvd_hdl])
+                {
+                    SoapySDR_logf(SOAPY_SDR_INFO,
+                                  "RX handle %u: dropped %lu blocks while the buffer was full",
+                                  rcvd_hdl,
+                                  static_cast<unsigned long>(rx_ring_dropped[rcvd_hdl]));
+                    rx_ring_dropping[rcvd_hdl] = false;
+                    rx_ring_dropped[rcvd_hdl] = 0;
+                }
+
+                memcpy(rxRingBlock(rcvd_hdl, write_index),
                        (void *)tmp_p_rx_block,
                        len);
-                rxWriteIndex[rcvd_hdl] =
-                    (rxWriteIndex[rcvd_hdl] + 1) % DEFAULT_NUM_BUFFERS;
+                rxWriteIndex[rcvd_hdl] = next_write;
             }
         }
         else if (status == skiq_rx_status_error_overrun)
         {
             SoapySDR_logf(SOAPY_SDR_WARNING, "overrun detected, (card %u)", card);
-            rx_overflow_pending = true;
         }
         else
         {
@@ -416,25 +494,26 @@ SoapySDR::Stream *SoapySidekiq::setupStream(const int direction,
             rx_fifo_time_ns[h] = 0;
         }
 
-        // allocate the RAM buffers for each selected RX handle
         for (const auto handle : rx_stream_handles)
         {
-            const int h = static_cast<int>(handle);
-            rx_handle_enabled[h] = true;
+            rx_handle_enabled[handle] = true;
+        }
 
-            for (int i = 0; i < DEFAULT_NUM_BUFFERS; i++)
+        rx_buffer_ms = DEFAULT_RX_BUFFER_MS;
+        if (args.count("buffer_ms") != 0)
+        {
+            try
             {
-                if (p_rx_block[h][i] == NULL)
-                {
-                    p_rx_block[h][i] = (skiq_rx_block_t *)malloc(rx_block_size_in_bytes);
-                    if (p_rx_block[h][i] == NULL)
-                    {
-                        SoapySDR_log(SOAPY_SDR_ERROR, "malloc failed to allocate RX memory");
-                        throw std::runtime_error("");
-                    }
-                }
-
-                memset(p_rx_block[h][i], 0, rx_block_size_in_bytes);
+                rx_buffer_ms = std::stod(args.at("buffer_ms"));
+            }
+            catch (const std::logic_error &)
+            {
+                rx_buffer_ms = -1;
+            }
+            if (!std::isfinite(rx_buffer_ms) || rx_buffer_ms <= 0)
+            {
+                throw std::runtime_error("invalid buffer_ms stream argument '" +
+                                         args.at("buffer_ms") + "'");
             }
         }
 
@@ -505,6 +584,10 @@ SoapySDR::Stream *SoapySidekiq::setupStream(const int direction,
             throw std::runtime_error("");
         }
         SoapySDR_logf(SOAPY_SDR_INFO, "System Timestamp Freq: %llu", this->sys_freq);
+
+        // the ring is sized from the stream's sample rate, so allocate it
+        // once the rate has been programmed
+        allocateRxRings();
 
         /* set rx sample order */
         if (iq_swap == true)
@@ -656,15 +739,12 @@ void SoapySidekiq::closeStream(SoapySDR::Stream *stream)
 
         for (int h = 0; h < skiq_rx_hdl_end; h++)
         {
-            for (int i = 0; i < DEFAULT_NUM_BUFFERS; i++)
-            {
-                free(p_rx_block[h][i]);
-                p_rx_block[h][i] = NULL;
-            }
+            rx_ring_storage[h].reset();
             rx_fifo_buffer[h].clear();
             rx_fifo_offset[h] = 0;
             rx_handle_enabled[h] = false;
         }
+        rx_ring_blocks = 0;
         rx_stream_handles.clear();
         rx_stream_setup = false;
     }
@@ -727,7 +807,16 @@ int SoapySidekiq::activateStream(SoapySDR::Stream *stream,
             return SOAPY_SDR_STREAM_ERROR;
         }
 
-        rx_overflow_pending = false;
+        // the rate may have been raised since setupStream(); make sure the
+        // ring still holds the requested amount of time
+        if (rxRingBlocksForRate(rx_sample_rate_by_handle[rx_stream_handles.front()]) >
+            rx_ring_blocks)
+        {
+            allocateRxRings();
+        }
+
+        rx_ring_overrun = false;
+        rx_resync_pending = false;
         for (const auto handle : rx_stream_handles)
         {
             rxWriteIndex[handle] = 0;
@@ -736,6 +825,9 @@ int SoapySidekiq::activateStream(SoapySDR::Stream *stream,
             rx_expected_timestamp[handle] = 0;
             rx_fifo_buffer[handle].clear();
             rx_fifo_offset[handle] = 0;
+            rx_ring_dropping[handle] = false;
+            rx_ring_dropped[handle] = 0;
+            rx_read_expected_valid[handle] = false;
         }
 
         //  start the receive thread
@@ -1122,15 +1214,44 @@ int SoapySidekiq::readStream(SoapySDR::Stream *stream,
     // Samples were lost since the last read: report it once, as other Soapy
     // drivers do, so the application knows the data is discontinuous.  The
     // next read returns the samples that follow the gap.
-    if (rx_overflow_pending.exchange(false))
+    // The application fell a full buffer behind: discard the older half of
+    // the backlog, the same amount on every channel.  The jump shows up as a
+    // timestamp gap below and is reported like any other.
+    if (rx_ring_overrun.exchange(false))
     {
+        const uint32_t read_index = rxReadIndex[rx_stream_handles.front()];
+        const uint32_t queued =
+            (rxWriteIndex[rx_stream_handles.front()] + rx_ring_blocks - read_index) %
+            rx_ring_blocks;
+        for (const auto handle : rx_stream_handles)
+        {
+            rxReadIndex[handle] = (rxReadIndex[handle] + queued / 2) % rx_ring_blocks;
+        }
+    }
+
+    // Report a gap: drop leftovers from before it and tell the application
+    // the data is discontinuous.  The next read returns the samples that
+    // follow the gap.
+    auto report_overflow = [this, &flags]() -> int
+    {
+        // leftover samples from before the gap are no longer contiguous
+        for (const auto handle : rx_stream_handles)
+        {
+            rx_fifo_buffer[handle].clear();
+            rx_fifo_offset[handle] = 0;
+            rx_read_expected_valid[handle] = false;
+        }
+        rx_resync_pending = rx_stream_handles.size() > 1;
+
         flags = 0;
         return SOAPY_SDR_OVERFLOW;
-    }
+    };
+
 
     size_t samples_done = 0;
     bool timestamp_set = false;
-    long waitTime = (timeoutUs == 0) ? SLEEP_1SEC : timeoutUs;
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::microseconds(timeoutUs <= 0 ? SLEEP_1SEC : timeoutUs);
 
     auto block_time_ns = [this](const skiq_rx_block_t *block_ptr) -> long long
     {
@@ -1225,8 +1346,10 @@ int SoapySidekiq::readStream(SoapySDR::Stream *stream,
             return;
         }
 
-        skiq_rx_block_t *block_ptr = p_rx_block[handle][rxReadIndex[handle]];
+        skiq_rx_block_t *block_ptr = rxRingBlock(handle, rxReadIndex[handle]);
         const volatile int16_t *block_data = block_ptr->data;
+        rx_read_expected_ts[handle] = block_ptr->rf_timestamp + rx_payload_size_in_words;
+        rx_read_expected_valid[handle] = true;
 
         if (timestamps_from_this_handle && !timestamp_set)
         {
@@ -1269,35 +1392,101 @@ int SoapySidekiq::readStream(SoapySDR::Stream *stream,
                 block_time_ns(block_ptr) + samples_to_ns(handle, count);
         }
 
-        rxReadIndex[handle] = (rxReadIndex[handle] + 1) % DEFAULT_NUM_BUFFERS;
+        rxReadIndex[handle] = (rxReadIndex[handle] + 1) % rx_ring_blocks;
+    };
+
+    // After a loss, drop blocks on the channels that are behind until every
+    // channel's next block carries the same timestamp.  Returns false while a
+    // channel has no block to compare yet.
+    auto resync_channels = [this]() -> bool
+    {
+        while (true)
+        {
+            uint64_t newest = 0;
+            for (const auto handle : rx_stream_handles)
+            {
+                if (rxReadIndex[handle] == rxWriteIndex[handle])
+                {
+                    return false;
+                }
+                const uint64_t head =
+                    rxRingBlock(handle, rxReadIndex[handle])->rf_timestamp;
+                newest = std::max(newest, head);
+            }
+
+            bool aligned = true;
+            for (const auto handle : rx_stream_handles)
+            {
+                if (rxRingBlock(handle, rxReadIndex[handle])->rf_timestamp < newest)
+                {
+                    rxReadIndex[handle] = (rxReadIndex[handle] + 1) % rx_ring_blocks;
+                    aligned = false;
+                }
+            }
+
+            if (aligned)
+            {
+                return true;
+            }
+        }
     };
 
     while (samples_done < numElems)
     {
-        while (waitTime > 0)
+        bool ready = false;
+        while (true)
         {
-            bool all_channels_ready = true;
+            if (rx_resync_pending && resync_channels())
+            {
+                rx_resync_pending = false;
+            }
+
+            ready = !rx_resync_pending;
             for (const auto handle : rx_stream_handles)
             {
-                if (available_samples(handle) == 0)
+                if (!ready || available_samples(handle) == 0)
                 {
-                    all_channels_ready = false;
+                    ready = false;
                     break;
                 }
             }
 
-            if (all_channels_ready)
+            if (ready || std::chrono::steady_clock::now() >= deadline)
             {
                 break;
             }
 
             usleep(DEFAULT_SLEEP_US);
-            waitTime -= DEFAULT_SLEEP_US;
         }
 
-        if (waitTime <= 0)
+        if (!ready)
         {
             return (samples_done > 0) ? samples_done : SOAPY_SDR_TIMEOUT;
+        }
+
+        // Never return samples that span a gap: if the next block on any
+        // channel is not the one that follows the samples already returned,
+        // end this read here and report the gap on its own.
+        bool gap = false;
+        for (const auto handle : rx_stream_handles)
+        {
+            const size_t fifo_left =
+                (rx_fifo_buffer[handle].size() / 2) - rx_fifo_offset[handle];
+            if (fifo_left == 0 && rx_read_expected_valid[handle] &&
+                rxRingBlock(handle, rxReadIndex[handle])->rf_timestamp !=
+                    rx_read_expected_ts[handle])
+            {
+                gap = true;
+                break;
+            }
+        }
+        if (gap)
+        {
+            if (samples_done > 0)
+            {
+                return samples_done;
+            }
+            return report_overflow();
         }
 
         size_t to_copy = numElems - samples_done;

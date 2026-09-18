@@ -5,6 +5,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -21,7 +22,12 @@
 #define DEFAULT_SAMPLE_RATE (20000000)
 #define DEFAULT_BANDWIDTH (18000000)
 #define DEFAULT_FREQUENCY (1000000000)
-#define DEFAULT_NUM_BUFFERS (30000)
+// The RX ring holds this much time at the stream's sample rate (at 61.44 MS/s
+// about 30000 blocks, 120 MB per channel; far less at lower rates).  It can be
+// changed with the "buffer_ms" stream argument.
+#define DEFAULT_RX_BUFFER_MS (500.0)
+#define MIN_RX_RING_BLOCKS (64)
+#define MAX_RX_RING_BLOCKS (262144)
 // libsidekiq queues at most SKIQ_MAX_NUM_TX_QUEUED_PACKETS (50) TX packets, so
 // only a small ring is ever in flight; each block is block-size * 4 bytes.
 #define DEFAULT_NUM_TX_BUFFERS (256)
@@ -358,9 +364,21 @@ class SoapySidekiq : public SoapySDR::Device
         bool rx_start_signal{};
         std::atomic<bool> tx_start_signal{};
         std::atomic<bool> rx_receive_operation_exited_due_to_error{};
-        // set by the receive thread when samples were lost; readStream()
-        // reports it once as SOAPY_SDR_OVERFLOW
-        std::atomic<bool> rx_overflow_pending{};
+        // Set by the receive thread when a full ring forced it to drop blocks;
+        // readStream() then discards part of the backlog to catch up.  Every
+        // gap (dropped blocks, libsidekiq overruns, retunes) is reported to
+        // the application as SOAPY_SDR_OVERFLOW at the point it occurs, found
+        // from the block timestamps.
+        std::atomic<bool> rx_ring_overrun{};
+        // multi-channel streams re-align their channels by timestamp after a
+        // loss before returning more samples (readStream() thread only)
+        bool rx_resync_pending{};
+        bool rx_ring_dropping[skiq_rx_hdl_end]{};
+        // readStream() side: timestamp the next block must carry to be
+        // contiguous with the samples already returned
+        uint64_t rx_read_expected_ts[skiq_rx_hdl_end]{};
+        bool rx_read_expected_valid[skiq_rx_hdl_end]{};
+        uint64_t rx_ring_dropped[skiq_rx_hdl_end]{};
         bool rx_stream_setup{};
         bool tx_stream_setup{};
         bool tx_stream_active{};
@@ -408,7 +426,19 @@ class SoapySidekiq : public SoapySDR::Device
         uint64_t sys_freq{};
 
         // RX buffer
-        skiq_rx_block_t *p_rx_block[skiq_rx_hdl_end][DEFAULT_NUM_BUFFERS]{};
+        // one contiguous ring of RX blocks per streaming handle
+        std::unique_ptr<uint8_t[]> rx_ring_storage[skiq_rx_hdl_end];
+        uint32_t rx_ring_blocks{};
+        size_t rx_ring_stride{};
+        double rx_buffer_ms{DEFAULT_RX_BUFFER_MS};
+        uint32_t rxRingBlocksForRate(const uint32_t sample_rate) const;
+        void allocateRxRings(void);
+        skiq_rx_block_t *rxRingBlock(const skiq_rx_hdl_t handle,
+                                     const uint32_t index) const
+        {
+            return reinterpret_cast<skiq_rx_block_t *>(
+                rx_ring_storage[handle].get() + index * rx_ring_stride);
+        }
         // Ring indices shared by the receive thread (writer) and readStream()
         // (reader).  Atomic so a block's contents are visible to the reader
         // before the write index that publishes it, including on ARM targets.
