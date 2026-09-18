@@ -145,6 +145,11 @@ application falls further behind than that, samples are dropped and the next
 for any other discontinuity, such as retuning while streaming. Samples
 returned by a single `readStream()` call are always contiguous.
 
+Passing `SOAPY_SDR_HAS_TIME` to `activateStream()` starts the stream on the
+next 1PPS edge. For TX, `writeStream()` accepts samples once the stream has
+started; until then it waits up to its timeout and returns `SOAPY_SDR_TIMEOUT`,
+so the call can simply be retried.
+
 The `rx_channel` alias is intended to improve selected-path operation in
 single-client applications such as Gqrx. It does not bypass libsidekiq card
 ownership, so multiple independent processes still cannot open the same
