@@ -71,7 +71,7 @@ SOAPY_SDR_MODULE_UTIL(
     VERSION ${SOAPYSIDEKIQ_VERSION}
     SOURCES
         SoapySidekiq.hpp
-        Registation.cpp
+        Registration.cpp
         Settings.cpp
         Streaming.cpp
         Sensor.cpp
