@@ -227,20 +227,28 @@ void SoapySidekiq::acquireSidekiqCard(const uint8_t requested_card,
 
     if (sidekiq_card_ref_count[requested_card] == 0)
     {
-        // libsidekiq v4.26.0 crashes in skiq_enable_cards() when given a card
-        // number that is not installed, so check that the card exists first.
-        uint8_t num_cards = 0;
-        uint8_t card_list[SKIQ_MAX_NUM_CARDS] = {};
-        status = skiq_get_cards(skiq_xport_type_auto, &num_cards, card_list);
-        const bool card_present = (status == 0) &&
-            (std::find(card_list, card_list + num_cards, requested_card) !=
-             card_list + num_cards);
-        if (!card_present)
+        // libsidekiq v4.26.0 crashes in skiq_enable_cards() when the card is
+        // not installed or is already owned by another process, so check
+        // first.  A card locked by another thread of this process reports
+        // this process as the owner and is fine: the reference count above
+        // means only the first instance enables it.
+        pid_t owner = 0;
+        status = skiq_is_card_avail(requested_card, &owner);
+        const bool busy_elsewhere = status == EBUSY && owner != getpid();
+        if (status != 0 && !(status == EBUSY && owner == getpid()))
         {
-            SoapySDR_logf(SOAPY_SDR_ERROR,
-                          "Sidekiq card %u was not found (skiq_get_cards status %d, "
-                          "%u card(s) present)",
-                          requested_card, status, num_cards);
+            if (busy_elsewhere)
+            {
+                SoapySDR_logf(SOAPY_SDR_ERROR,
+                              "Sidekiq card %u is in use by process %d",
+                              requested_card, static_cast<int>(owner));
+            }
+            else
+            {
+                SoapySDR_logf(SOAPY_SDR_ERROR,
+                              "Sidekiq card %u is not available (skiq_is_card_avail "
+                              "status %d)", requested_card, status);
+            }
 
             if (sidekiq_instance_count == 0)
             {
@@ -248,9 +256,12 @@ void SoapySidekiq::acquireSidekiqCard(const uint8_t requested_card,
                 sidekiq_library_initialized = false;
             }
 
-            throw std::runtime_error("Sidekiq card " +
-                                     std::to_string(requested_card) +
-                                     " was not found");
+            throw std::runtime_error(
+                busy_elsewhere
+                    ? "Sidekiq card " + std::to_string(requested_card) +
+                          " is in use by process " + std::to_string(owner)
+                    : "Sidekiq card " + std::to_string(requested_card) +
+                          " was not found");
         }
 
         const uint8_t cards[] = {requested_card};
