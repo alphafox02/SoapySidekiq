@@ -1,0 +1,43 @@
+# Build and unit-test SoapySidekiq.
+#
+# libsidekiq is not redistributable, so this runs on a self-hosted runner that
+# has the Sidekiq SDK installed (labels: self-hosted, linux, sidekiq).  It is
+# off until the repository variable SIDEKIQ_CI is set to "true".
+#
+# Pull requests from forks never run here: on a public repository they would
+# execute untrusted code on the self-hosted machine.
+
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    if: >-
+      vars.SIDEKIQ_CI == 'true' &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: [self-hosted, linux, sidekiq]
+    strategy:
+      fail-fast: false
+      matrix:
+        # sidekiq-config (SDK v4.26.0+) and the legacy library search
+        use_sidekiq_config: ["ON", "OFF"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DSIDEKIQ_USE_SIDEKIQ_CONFIG=${{ matrix.use_sidekiq_config }}
+          -DCMAKE_CXX_FLAGS="-Wall -Wextra -Wno-unused-parameter -Werror"
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Unit tests
+        run: ctest --test-dir build --output-on-failure --label-exclude hardware

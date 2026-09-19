@@ -251,6 +251,22 @@ The `tests/` directory contains Python examples and C++ smoke-test utilities:
 - `antenna_smoke`: RF-port listing and switching checks
 - `range_smoke`: rate, bandwidth, frequency, gain, and native-scale checks
 
+`unit_tests` checks the driver's internal helpers (rate and bandwidth tables,
+gain conversions, handle mapping, validation) without any hardware:
+
+```bash
+ctest --test-dir build --label-exclude hardware
+```
+
+Configure with `-DSOAPYSIDEKIQ_ENABLE_HARDWARE_TESTS=ON` to also register the
+smoke tests, which need an attached card.
+
+`.github/workflows/build.yml` builds with and without `sidekiq-config` and runs
+the unit tests. libsidekiq cannot be downloaded in CI, so it needs a
+self-hosted runner with the Sidekiq SDK installed and labeled `sidekiq`, and it
+only runs once the repository variable `SIDEKIQ_CI` is set to `true`. Pull
+requests from forks are never run on that machine.
+
 Common validation commands:
 
 ```bash
