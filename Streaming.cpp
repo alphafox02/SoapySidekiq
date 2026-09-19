@@ -661,6 +661,25 @@ SoapySDR::Stream *SoapySidekiq::setupStream(const int direction,
                                      "close it before setting up another");
         }
 
+        tx_timed_mode = TX_TIMED_OFF;
+        if (args.count("tx_timestamps") != 0)
+        {
+            const std::string &mode = args.at("tx_timestamps");
+            if (equalsIgnoreCase(mode, "true") || mode == "1")
+            {
+                tx_timed_mode = TX_TIMED_ON;
+            }
+            else if (equalsIgnoreCase(mode, "allow_late"))
+            {
+                tx_timed_mode = TX_TIMED_ALLOW_LATE;
+            }
+            else if (!(equalsIgnoreCase(mode, "false") || mode == "0"))
+            {
+                throw std::runtime_error("invalid tx_timestamps stream argument '" + mode +
+                                         "' (true, allow_late or false)");
+            }
+        }
+
         //  check the channel configuration
         if (channels.size() > 1)
         {
@@ -983,9 +1002,50 @@ int SoapySidekiq::activateStream(SoapySDR::Stream *stream,
         }
         SoapySDR_logf(SOAPY_SDR_INFO, "TX block size is: %u", current_tx_block_size);
 
-        //  tx data flow mode
-        status = skiq_write_tx_data_flow_mode(card, tx_hdl,
-                                              skiq_tx_immediate_data_flow_mode);
+        //  tx data flow mode: immediate, or held until each block's timestamp
+        const skiq_tx_flow_mode_t flow_mode =
+            tx_timed_mode == TX_TIMED_ON ? skiq_tx_with_timestamps_data_flow_mode
+            : tx_timed_mode == TX_TIMED_ALLOW_LATE
+                ? skiq_tx_with_timestamps_allow_late_data_flow_mode
+                : skiq_tx_immediate_data_flow_mode;
+        tx_timed_rf = rfTimeSource;
+        tx_burst_active = false;
+        tx_late_count = 0;
+        tx_time_ignored_warned = false;
+        if (tx_timed_mode != TX_TIMED_OFF)
+        {
+#if defined(LIBSIDEKIQ_VERSION) && (LIBSIDEKIQ_VERSION >= 41600)
+            const skiq_tx_timestamp_base_t base =
+                tx_timed_rf ? skiq_tx_rf_timestamp : skiq_tx_system_timestamp;
+            status = skiq_write_tx_timestamp_base(card, base);
+            // some cards accept the system base but keep using the RF counter
+            // (seen on a Stretch), so confirm it by reading it back
+            skiq_tx_timestamp_base_t applied = skiq_tx_rf_timestamp;
+            const bool confirmed = status == 0 &&
+                skiq_read_tx_timestamp_base(card, &applied) == 0 && applied == base;
+            if (!confirmed && !tx_timed_rf)
+            {
+                throw std::runtime_error("this card cannot time TX on the system clock; "
+                                         "set timetype to rf_timestamp");
+            }
+            if (status != 0)
+            {
+                SoapySDR_logf(SOAPY_SDR_DEBUG,
+                              "skiq_write_tx_timestamp_base failed (status %d); "
+                              "using the default RF timestamp base", status);
+            }
+#else
+            if (!tx_timed_rf)
+            {
+                throw std::runtime_error("timing TX on the system clock needs libsidekiq "
+                                         "v4.16.0 or later; set timetype to rf_timestamp");
+            }
+#endif
+            SoapySDR_logf(SOAPY_SDR_INFO, "TX blocks are sent at their timestamps (%s clock%s)",
+                          tx_timed_rf ? "RF sample" : "system",
+                          tx_timed_mode == TX_TIMED_ALLOW_LATE ? ", late blocks sent" : "");
+        }
+        status = skiq_write_tx_data_flow_mode(card, tx_hdl, flow_mode);
         if (status != 0)
         {
             SoapySDR_logf(
@@ -1066,6 +1126,14 @@ int SoapySidekiq::activateStream(SoapySDR::Stream *stream,
                     "started transmit streaming on handle: %u",
                     tx_hdl);
             tx_start_state = TX_START_DONE;
+        }
+
+        // libsidekiq's late count is not always reset when streaming starts,
+        // so report only increases from here
+        if (tx_timed_mode == TX_TIMED_ON)
+        {
+            uint32_t late = 0;
+            tx_late_count = skiq_read_tx_num_late_timestamps(card, tx_hdl, &late) == 0 ? late : 0;
         }
 
         tx_stream_active = true;
@@ -1160,15 +1228,10 @@ int SoapySidekiq::deactivateStream(SoapySDR::Stream *stream, const int flags,
     {
         // send the last partial block, padded with zeros, if the stream is
         // actually running
-        if (tx_staging_fill > 0 && !tx_staging_buffer.empty() &&
-            tx_start_state == TX_START_DONE)
+        if (tx_staging_fill > 0 && tx_start_state == TX_START_DONE)
         {
-            memset(tx_staging_buffer.data() + tx_staging_fill,
-                   0,
-                   tx_staging_buffer.size() - tx_staging_fill);
-            status = transmitBlock(tx_staging_buffer.data(),
-                                   std::chrono::steady_clock::now() +
-                                       std::chrono::seconds(1));
+            status = flushPartialTxBlock(std::chrono::steady_clock::now() +
+                                         std::chrono::seconds(1));
             if (status != 0)
             {
                 SoapySDR_logf(SOAPY_SDR_WARNING,
@@ -1611,6 +1674,12 @@ int SoapySidekiq::transmitBlock(const uint8_t *inbuff_ptr,
         }
     }
 
+    if (tx_timed_mode != TX_TIMED_OFF)
+    {
+        skiq_tx_set_block_timestamp(p_tx_block[currTXBuffIndex],
+                                    static_cast<uint64_t>(std::llround(tx_next_timestamp)));
+    }
+
     while (true)
     {
         const int status = skiq_transmit(this->card,
@@ -1621,6 +1690,12 @@ int SoapySidekiq::transmitBlock(const uint8_t *inbuff_ptr,
         {
             // move the index into the transmit block array
             currTXBuffIndex = (currTXBuffIndex + 1) % DEFAULT_NUM_TX_BUFFERS;
+            if (tx_timed_mode != TX_TIMED_OFF)
+            {
+                tx_next_timestamp += current_tx_block_size *
+                    (tx_timed_rf ? 1.0 : static_cast<double>(sys_freq) /
+                                         tx_sample_rate_by_handle[tx_hdl]);
+            }
             return 0;
         }
 
@@ -1643,6 +1718,44 @@ int SoapySidekiq::transmitBlock(const uint8_t *inbuff_ptr,
         return (status == SKIQ_TX_ASYNC_SEND_QUEUE_FULL) ? SOAPY_SDR_TIMEOUT
                                                          : SOAPY_SDR_STREAM_ERROR;
     }
+}
+
+// Timestamp ticks per nanosecond on the clock used for timed TX
+double SoapySidekiq::txTicksPerNs(void) const
+{
+    return (tx_timed_rf ? static_cast<double>(tx_sample_rate_by_handle[tx_hdl])
+                        : static_cast<double>(sys_freq)) / 1e9;
+}
+
+uint64_t SoapySidekiq::txTimestampNow(void) const
+{
+    uint64_t now = 0;
+    const int status = tx_timed_rf ? skiq_read_curr_tx_timestamp(card, tx_hdl, &now)
+                                   : skiq_read_curr_sys_timestamp(card, &now);
+    if (status != 0)
+    {
+        throw std::runtime_error("failed to read the current TX timestamp (status " +
+                                 std::to_string(status) + ")");
+    }
+    return now;
+}
+
+// Send the samples staged so far, padded with zeros to a full block.
+int SoapySidekiq::flushPartialTxBlock(const std::chrono::steady_clock::time_point deadline)
+{
+    if (tx_staging_fill == 0 || tx_staging_buffer.empty())
+    {
+        return 0;
+    }
+    memset(tx_staging_buffer.data() + tx_staging_fill, 0,
+           tx_staging_buffer.size() - tx_staging_fill);
+    tx_staging_fill = tx_staging_buffer.size();
+    const int status = transmitBlock(tx_staging_buffer.data(), deadline);
+    if (status == 0)
+    {
+        tx_staging_fill = 0;
+    }
+    return status;
 }
 
 int SoapySidekiq::writeStream(SoapySDR::Stream * stream,
@@ -1684,6 +1797,37 @@ int SoapySidekiq::writeStream(SoapySDR::Stream * stream,
         tx_staging_buffer.resize(tx_bytes_per_sample * current_tx_block_size);
     }
 
+    if (tx_timed_mode != TX_TIMED_OFF)
+    {
+        if ((flags & SOAPY_SDR_HAS_TIME) != 0)
+        {
+            // a new burst: finish what is staged from the previous one first
+            if (tx_burst_active && tx_staging_fill > 0)
+            {
+                const int status = flushPartialTxBlock(deadline);
+                if (status != 0)
+                {
+                    return status;
+                }
+            }
+            tx_next_timestamp = static_cast<double>(timeNs) * txTicksPerNs();
+            tx_burst_active = true;
+        }
+        else if (!tx_burst_active)
+        {
+            // untimed data: start shortly after now so it is not late
+            tx_next_timestamp = static_cast<double>(txTimestampNow()) + 20e6 * txTicksPerNs();
+            tx_burst_active = true;
+        }
+    }
+    else if ((flags & SOAPY_SDR_HAS_TIME) != 0 && !tx_time_ignored_warned)
+    {
+        SoapySDR_log(SOAPY_SDR_WARNING,
+                     "writeStream timeNs is ignored; set up the TX stream with "
+                     "tx_timestamps=true to send at a given time");
+        tx_time_ignored_warned = true;
+    }
+
     const uint8_t *input = reinterpret_cast<const uint8_t *>(buffs[0]);
     size_t consumed = 0;
 
@@ -1718,6 +1862,17 @@ int SoapySidekiq::writeStream(SoapySDR::Stream * stream,
         consumed += chunk;
     }
 
+    if ((flags & SOAPY_SDR_END_BURST) != 0)
+    {
+        // send the end of the burst now instead of waiting for a full block
+        const int status = flushPartialTxBlock(deadline);
+        if (status != 0)
+        {
+            return (consumed > 0) ? static_cast<int>(consumed) : status;
+        }
+        tx_burst_active = false;
+    }
+
     return static_cast<int>(consumed);
 }
 
@@ -1735,15 +1890,35 @@ int SoapySidekiq::readStreamStatus(SoapySDR::Stream *stream,
         return SOAPY_SDR_NOT_SUPPORTED;
     }
 
+    // blocks whose time had already passed were dropped (timed TX only)
+    if (tx_timed_mode == TX_TIMED_ON)
+    {
+        uint32_t late = 0;
+        if (skiq_read_tx_num_late_timestamps(this->card, this->tx_hdl, &late) == 0 &&
+            late > this->tx_late_count)
+        {
+            SoapySDR_logf(SOAPY_SDR_INFO, "TX late timestamps: %u", late);
+            this->tx_late_count = late;
+            timeNs = 0;
+            return SOAPY_SDR_TIME_ERROR;
+        }
+    }
+
+    // the underrun count is only kept in immediate (untimed) mode
+    if (tx_timed_mode != TX_TIMED_OFF)
+    {
+        return 0;
+    }
+
     /* This call will return a cumulative number of underruns since start
      * streaming */
     status = skiq_read_tx_num_underruns(this->card, this->tx_hdl, &errors);
     if (status != 0)
     {
-        SoapySDR_logf(SOAPY_SDR_ERROR,
+        SoapySDR_logf(SOAPY_SDR_DEBUG,
                       "skiq_read_tx_num_underruns failed, (card %u) status %d",
                       this->card, status);
-        throw std::runtime_error("");
+        return 0;
     }
 
     // if the total changed since last call indicate UNDERFLOW

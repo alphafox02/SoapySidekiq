@@ -461,6 +461,19 @@ class SoapySidekiq : public SoapySDR::Device
         enum TxStartState { TX_START_IDLE, TX_START_PENDING, TX_START_DONE, TX_START_FAILED };
         std::atomic<int> tx_start_state{TX_START_IDLE};
 
+        // Timed TX bursts ("tx_timestamps" stream argument): each block
+        // carries the time it is sent at, on the TX RF sample counter or the
+        // system clock depending on the "timetype" setting.
+        enum TxTimedMode { TX_TIMED_OFF, TX_TIMED_ON, TX_TIMED_ALLOW_LATE };
+        TxTimedMode tx_timed_mode{TX_TIMED_OFF};
+        bool tx_timed_rf{true};          // RF sample counter, else system clock
+        bool tx_burst_active{};          // tx_next_timestamp is valid
+        double tx_next_timestamp{};      // ticks for the next block
+        uint32_t tx_late_count{};
+        bool tx_time_ignored_warned{};
+        double txTicksPerNs(void) const;
+        uint64_t txTimestampNow(void) const;
+
         uint8_t  num_tx_channels{};
         skiq_tx_hdl_t tx_hdl{};
         uint64_t tx_center_frequency{};
@@ -554,6 +567,7 @@ class SoapySidekiq : public SoapySDR::Device
         void waitForTxSpace(void);
         int transmitBlock(const uint8_t *data,
                           const std::chrono::steady_clock::time_point deadline);
+        int flushPartialTxBlock(const std::chrono::steady_clock::time_point deadline);
 
     public:
         // Serializes libsidekiq calls that are not thread safe (library
