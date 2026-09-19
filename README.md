@@ -133,13 +133,54 @@ On cards that support a GPS-disciplined oscillator (SDK v4.15.0 or newer), the
 The antenna bias is on by default, so an active GPS antenna works without any
 setup. The sysfs entries are writable only by root; to let applications
 running as a normal user change the GPS settings, install the provided udev
-rule, which gives the `plugdev` group write access whenever the card appears:
+rule, which gives the `plugdev` group write access whenever the card appears.
+`cmake --install` installs it to `/etc/udev/rules.d` (configure with
+`-DINSTALL_UDEV_RULES=OFF` to skip it, or `-DUDEV_RULES_PATH=...` to change the
+directory). To apply it without rebooting:
 
 ```bash
-sudo cp udev/99-sidekiq-gps.rules /etc/udev/rules.d/
 sudo udevadm control --reload
 sudo udevadm trigger --action=bind --subsystem-match=platform --sysname-match='skiq_gps.*'
 ```
+
+### Advanced channel settings
+
+These per-channel settings (`writeSetting(direction, channel, key, value)`)
+expose libsidekiq features that SoapySDR has no API for. List them with
+`SoapySDRUtil --probe` or `getSettingInfo(direction, channel)`.
+
+- Frequency hopping: `freq_tune_mode` (`standard`, `hop_immediate`,
+  `hop_on_timestamp`), `freq_hop_list` (comma-separated Hz), `freq_hop_next`,
+  `freq_hop_perform` (time in ns on the readStream() timebase, or 0 for now)
+  and `freq_hop_current`. Set the tune mode and hop list before
+  `activateStream()`; hops can then be performed while streaming. libsidekiq
+  keeps one hop pending: writing the list makes its first entry pending, and
+  before each `freq_hop_perform` write `freq_hop_next` with the entry to follow
+  the pending one. NV100/NVM2 advance through the list on their own.
+
+  ```python
+  sdr.writeSetting(SOAPY_SDR_RX, 0, "freq_tune_mode", "hop_immediate")
+  sdr.writeSetting(SOAPY_SDR_RX, 0, "freq_hop_list", "902e6,915e6,928e6")
+  # ... setupStream / activateStream ...
+  sdr.writeSetting(SOAPY_SDR_RX, 0, "freq_hop_next", "1")      # after 902 MHz comes 915 MHz
+  sdr.writeSetting(SOAPY_SDR_RX, 0, "freq_hop_perform", "0")   # hop to 902 MHz now
+  ```
+
+- `rf_filter`: RF preselect filter (RX) or filter path (TX), chosen from the
+  filters the card reports, or `auto` to follow the LO frequency (the default;
+  any retune re-selects automatically).
+- `fir_gain`, `fir_config` (read only) and `fir_coeffs`: the RFIC's digital FIR.
+  The coefficients are shared by the RFIC's channels and replaced by any
+  sample-rate or bandwidth change; Epiq advises against writing them.
+
+Device settings on NV100/NVM2 (SDK v4.22.0 or newer): `user_cal_save`,
+`user_cal_load` and `user_cal_clear` take a calibration name.
+
+On Sidekiq X2, X4 and Matchstiq X40, a profile made with Analog Devices' profile
+tool can be loaded at open with the `rfic_profile` device argument, e.g.
+`driver=sidekiq,card=0,rfic_profile=/path/to/profile.txt`. The rate it sets is
+kept until the application changes the sample rate or bandwidth itself, since
+that replaces the profile.
 
 ### Topologies (Matchstiq Z4)
 

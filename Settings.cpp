@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <cinttypes>
 #include <fstream>
@@ -1426,6 +1427,42 @@ uint32_t defaultBandwidthForPart(const skiq_part_t part, const uint32_t sample_r
 }
 }
 
+void SoapySidekiq::loadRficProfile(const std::string &path)
+{
+    FILE *file = std::fopen(path.c_str(), "r");
+    if (file == nullptr)
+    {
+        throw std::runtime_error("cannot open rfic_profile '" + path + "': " +
+                                 std::strerror(errno));
+    }
+    const int status = skiq_prog_rfic_from_file(file, card);
+    std::fclose(file);
+    if (status != 0)
+    {
+        SoapySDR_logf(SOAPY_SDR_ERROR,
+                      "skiq_prog_rfic_from_file failed (card %u, %s), status %d",
+                      card, path.c_str(), status);
+        throw std::runtime_error("failed to load rfic_profile '" + path + "' (status " +
+                                 std::to_string(status) + "); runtime profiles are "
+                                 "supported on Sidekiq X2, X4 and Matchstiq X40");
+    }
+    SoapySDR_logf(SOAPY_SDR_INFO, "card %u: loaded RFIC profile %s", card, path.c_str());
+}
+
+bool SoapySidekiq::rxHandleHopping(const skiq_rx_hdl_t handle) const
+{
+    skiq_freq_tune_mode_t mode = skiq_freq_tune_mode_standard;
+    return skiq_read_rx_freq_tune_mode(card, handle, &mode) == 0 &&
+           mode != skiq_freq_tune_mode_standard;
+}
+
+bool SoapySidekiq::txHandleHopping(const skiq_tx_hdl_t handle) const
+{
+    skiq_freq_tune_mode_t mode = skiq_freq_tune_mode_standard;
+    return skiq_read_tx_freq_tune_mode(card, handle, &mode) == 0 &&
+           mode != skiq_freq_tune_mode_standard;
+}
+
 // Constructor
 SoapySidekiq::SoapySidekiq(const SoapySDR::Kwargs &args)
 {
@@ -1582,6 +1619,14 @@ SoapySidekiq::SoapySidekiq(const SoapySDR::Kwargs &args)
         applyTopology(requested_topology);
     }
 
+    /* a runtime RFIC profile resets the radio, so it goes before any other
+     * radio configuration */
+    const bool rfic_profile_loaded = args.count("rfic_profile") != 0;
+    if (rfic_profile_loaded)
+    {
+        loadRficProfile(args.at("rfic_profile"));
+    }
+
     status = skiq_write_chan_mode(card, skiq_chan_mode_single);
     if (status != 0)
     {
@@ -1702,6 +1747,40 @@ SoapySidekiq::SoapySidekiq(const SoapySDR::Kwargs &args)
     {
         tx_sample_rate_by_handle[h] = DEFAULT_SAMPLE_RATE;
         tx_bandwidth_by_handle[h] = defaultBandwidthForPart(part, DEFAULT_SAMPLE_RATE);
+    }
+
+    if (rfic_profile_loaded)
+    {
+        // use the rates the profile configured until the application sets
+        // its own
+        for (uint8_t chan = 0; chan < num_rx_channels; chan++)
+        {
+            const skiq_rx_hdl_t h = this->param.rf_param.num_rx_channels > 0
+                ? this->param.rf_param.rx_handles[chan]
+                : static_cast<skiq_rx_hdl_t>(chan);
+            uint32_t rate = 0, bw = 0, actual_bw = 0;
+            double actual_rate = 0;
+            if (skiq_read_rx_sample_rate_and_bandwidth(card, h, &rate, &actual_rate,
+                                                       &bw, &actual_bw) == 0 && rate != 0)
+            {
+                rx_sample_rate_by_handle[h] = rate;
+                rx_bandwidth_by_handle[h] = bw != 0 ? bw : actual_bw;
+                rx_rate_from_profile[h] = true;
+            }
+        }
+        for (uint8_t chan = 0; chan < num_tx_channels; chan++)
+        {
+            const skiq_tx_hdl_t h = txHandleForChannel(chan);
+            uint32_t rate = 0, bw = 0, actual_bw = 0;
+            double actual_rate = 0;
+            if (skiq_read_tx_sample_rate_and_bandwidth(card, h, &rate, &actual_rate,
+                                                       &bw, &actual_bw) == 0 && rate != 0)
+            {
+                tx_sample_rate_by_handle[h] = rate;
+                tx_bandwidth_by_handle[h] = bw != 0 ? bw : actual_bw;
+                tx_rate_from_profile[h] = true;
+            }
+        }
     }
 
     if (num_rx_channels > 0)
@@ -3436,6 +3515,7 @@ void SoapySidekiq::writeRxSampleRateAndBandwidth(
             configured_rate != 0 ? configured_rate : sample_rate;
         this->rx_bandwidth_by_handle[handle] =
             configured_bw != 0 ? configured_bw : bandwidth;
+        this->rx_rate_from_profile[handle] = false;
     }
 }
 
@@ -3513,6 +3593,7 @@ void SoapySidekiq::writeTxSampleRateAndBandwidth(const skiq_tx_hdl_t handle,
         configured_rate != 0 ? configured_rate : sample_rate;
     this->tx_bandwidth_by_handle[handle] =
         configured_bw != 0 ? configured_bw : bandwidth;
+    this->tx_rate_from_profile[handle] = false;
 }
 
 void SoapySidekiq::setSampleRate(const int direction, const size_t channel,
@@ -3988,6 +4069,28 @@ SoapySDR::ArgInfoList SoapySidekiq::getSettingInfo(void) const
         setArgs.push_back(settingArg);
     }
 
+#if defined(LIBSIDEKIQ_VERSION) && (LIBSIDEKIQ_VERSION >= 42200)
+    if (partRequiresExactBuiltInSampleRate(part))
+    {
+        // NV100 / NVM2 (and the G20/G40 built on them)
+        settingArg.options.clear();
+        settingArg.type = SoapySDR::ArgInfo::STRING;
+        settingArg.value = "";
+        settingArg.key = "user_cal_save";
+        settingArg.name = "Save User Calibration";
+        settingArg.description = "Write: save the current RFIC calibration under this name";
+        setArgs.push_back(settingArg);
+        settingArg.key = "user_cal_load";
+        settingArg.name = "Load User Calibration";
+        settingArg.description = "Write: load the RFIC calibration saved under this name";
+        setArgs.push_back(settingArg);
+        settingArg.key = "user_cal_clear";
+        settingArg.name = "Clear User Calibration";
+        settingArg.description = "Write: clear the loaded RFIC calibration of this name";
+        setArgs.push_back(settingArg);
+    }
+#endif
+
     settingArg.key         = "timetype";
     settingArg.value       = "rf_timestamp";
     settingArg.name        = "timetype";
@@ -4090,6 +4193,30 @@ void SoapySidekiq::writeSetting(const std::string &key,
             throw std::runtime_error("");
         }
     }
+#if defined(LIBSIDEKIQ_VERSION) && (LIBSIDEKIQ_VERSION >= 42200)
+    else if (equalsIgnoreCase(key, "user_cal_save") ||
+             equalsIgnoreCase(key, "user_cal_load") ||
+             equalsIgnoreCase(key, "user_cal_clear"))
+    {
+        if (value.empty())
+        {
+            throw std::runtime_error(key + " needs a calibration name");
+        }
+        const int rfic_id = 0;   // the only RFIC ID libsidekiq supports here
+        const int result = equalsIgnoreCase(key, "user_cal_save")
+            ? skiq_user_radio_cal_save(card, rfic_id, value.c_str())
+            : equalsIgnoreCase(key, "user_cal_load")
+                ? skiq_user_radio_cal_load(card, rfic_id, value.c_str())
+                : skiq_user_radio_cal_clear(card, rfic_id, value.c_str());
+        if (result != 0)
+        {
+            throw std::runtime_error(key + " '" + value + "' failed (status " +
+                                     std::to_string(result) + "); user calibration is "
+                                     "supported on Sidekiq NV100, NVM2, G20 and G40");
+        }
+        SoapySDR_logf(SOAPY_SDR_INFO, "%s: %s", key.c_str(), value.c_str());
+    }
+#endif
     else if (equalsIgnoreCase(key, "gps_antenna_bias"))
     {
         writeGpsSysfs("ant_bias_en", (value == "true" || value == "1") ? "1" : "0");

@@ -563,11 +563,24 @@ SoapySDR::Stream *SoapySidekiq::setupStream(const int direction,
             rx_bandwidth_by_handle[first_handle] == 0
                 ? std::min<uint32_t>(DEFAULT_BANDWIDTH, stream_sample_rate)
                 : rx_bandwidth_by_handle[first_handle];
-        writeRxSampleRateAndBandwidth(
-                rx_stream_handles, stream_sample_rate, stream_bandwidth);
+        // keep a rate loaded from an rfic_profile: rewriting it, even with
+        // the same values, makes libsidekiq replace the profile
+        const bool keep_profile_rate =
+            std::all_of(rx_stream_handles.begin(), rx_stream_handles.end(),
+                        [this](const skiq_rx_hdl_t h) { return rx_rate_from_profile[h]; });
+        if (!keep_profile_rate)
+        {
+            writeRxSampleRateAndBandwidth(
+                    rx_stream_handles, stream_sample_rate, stream_bandwidth);
+        }
 
         for (const auto handle : rx_stream_handles)
         {
+            // a hopping handle is tuned through its hop list
+            if (rxHandleHopping(handle))
+            {
+                continue;
+            }
             if (rx_center_frequency_by_handle[handle] == 0)
             {
                 rx_center_frequency_by_handle[handle] =
@@ -682,10 +695,16 @@ SoapySDR::Stream *SoapySidekiq::setupStream(const int direction,
             tx_bandwidth_by_handle[tx_hdl] == 0
                 ? std::min<uint32_t>(DEFAULT_BANDWIDTH, stream_sample_rate)
                 : tx_bandwidth_by_handle[tx_hdl];
-        writeTxSampleRateAndBandwidth(tx_hdl, stream_sample_rate, stream_bandwidth);
-        setFrequency(SOAPY_SDR_TX, tx_soapy_channel,
-                     tx_center_frequency == 0 ? DEFAULT_FREQUENCY
-                                              : tx_center_frequency);
+        if (!tx_rate_from_profile[tx_hdl])
+        {
+            writeTxSampleRateAndBandwidth(tx_hdl, stream_sample_rate, stream_bandwidth);
+        }
+        if (!txHandleHopping(tx_hdl))
+        {
+            setFrequency(SOAPY_SDR_TX, tx_soapy_channel,
+                         tx_center_frequency == 0 ? DEFAULT_FREQUENCY
+                                                  : tx_center_frequency);
+        }
 
         status = skiq_read_sys_timestamp_freq(this->card, &this->sys_freq);
         if (status != 0)

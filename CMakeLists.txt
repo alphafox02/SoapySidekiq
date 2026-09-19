@@ -75,6 +75,7 @@ SOAPY_SDR_MODULE_UTIL(
         Settings.cpp
         Streaming.cpp
         Sensor.cpp
+        Advanced.cpp
     LIBRARIES
         ${Sidekiq_LIBRARIES}
         ${CMAKE_DL_LIBS}
@@ -83,6 +84,15 @@ SOAPY_SDR_MODULE_UTIL(
         ${Sidekiq_RUNTIME_LIBRARIES}
 
 )
+
+# udev rule giving the plugdev group access to the Sidekiq Stretch GPS
+# controls (antenna bias, GPS power) without root
+option(INSTALL_UDEV_RULES "Install the SoapySidekiq udev rules" ON)
+set(UDEV_RULES_PATH "/etc/udev/rules.d" CACHE PATH "Directory for udev rules")
+if (INSTALL_UDEV_RULES)
+    install(FILES udev/99-sidekiq-gps.rules DESTINATION ${UDEV_RULES_PATH})
+    message(STATUS "udev rules will be installed to ${UDEV_RULES_PATH}")
+endif ()
 
 include(CTest)
 

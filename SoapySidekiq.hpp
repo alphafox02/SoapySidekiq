@@ -300,6 +300,16 @@ class SoapySidekiq : public SoapySDR::Device
 
         std::string readSetting(const std::string &key) const;
 
+        // per-channel: frequency hopping, RF filter path, FIR (Advanced.cpp)
+        SoapySDR::ArgInfoList getSettingInfo(const int direction,
+                const size_t channel) const override;
+
+        void writeSetting(const int direction, const size_t channel,
+                const std::string &key, const std::string &value) override;
+
+        std::string readSetting(const int direction, const size_t channel,
+                const std::string &key) const override;
+
         /*******************************************************************
          * Time API
          ******************************************************************/
@@ -338,6 +348,9 @@ class SoapySidekiq : public SoapySDR::Device
         skiq_tx_hdl_t txHandleForChannel(const size_t channel) const;
         size_t mappedRxChannel(const size_t channel) const;
         void applyTopology(const uint8_t topology_id);
+        void loadRficProfile(const std::string &path);
+        bool rxHandleHopping(const skiq_rx_hdl_t handle) const;
+        bool txHandleHopping(const skiq_tx_hdl_t handle) const;
 
         // On-board GPS (Sidekiq Stretch): the sidekiq_gps kernel module
         // exposes control and status in /sys/fs/skiq_gps/<card>/.
@@ -430,6 +443,9 @@ class SoapySidekiq : public SoapySDR::Device
         uint64_t rx_center_frequency_by_handle[skiq_rx_hdl_end]{};
         uint32_t rx_sample_rate_by_handle[skiq_rx_hdl_end]{};
         uint32_t rx_bandwidth_by_handle[skiq_rx_hdl_end]{};
+        // rate/bandwidth set by an rfic_profile file; kept until the
+        // application changes them, since rewriting them replaces the profile
+        bool rx_rate_from_profile[skiq_rx_hdl_end]{};
         uint32_t rx_block_size_in_words{};
         uint32_t rx_block_size_in_bytes{};
         uint32_t rx_payload_size_in_bytes{};
@@ -456,6 +472,7 @@ class SoapySidekiq : public SoapySDR::Device
         uint64_t tx_center_frequency{};
         uint32_t tx_sample_rate_by_handle[skiq_tx_hdl_end]{};
         uint32_t tx_bandwidth_by_handle[skiq_tx_hdl_end]{};
+        bool tx_rate_from_profile[skiq_tx_hdl_end]{};
         uint32_t tx_underruns{};
         // incremented from libsidekiq's TX completion threads
         std::atomic<uint32_t> complete_count{};
