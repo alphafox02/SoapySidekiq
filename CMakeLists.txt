@@ -76,6 +76,7 @@ SOAPY_SDR_MODULE_UTIL(
         Streaming.cpp
         Sensor.cpp
         Advanced.cpp
+        SidekiqUtils.cpp
     LIBRARIES
         ${Sidekiq_LIBRARIES}
         ${CMAKE_DL_LIBS}

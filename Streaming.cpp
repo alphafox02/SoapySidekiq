@@ -13,8 +13,11 @@
 #include <unordered_map>
 
 #include "SoapySidekiq.hpp"
+#include "SidekiqUtils.hpp"
 #include <SoapySDR/Formats.hpp>
 #include <sidekiq_types.h>
+
+using namespace sidekiq;
 
 namespace
 {

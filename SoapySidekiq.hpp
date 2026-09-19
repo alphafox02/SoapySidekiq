@@ -67,12 +67,6 @@
 #define SOAPYSIDEKIQ_HAS_SDK_Z4_PART 0
 #endif
 
-// Look up the RX/TX parameters for a handle.  skiq_param_t's rx_param[] and
-// tx_param[] arrays are indexed by channel, not by handle.
-const skiq_rx_param_t &rxParamForHandle(const skiq_param_t &param,
-                                        const skiq_rx_hdl_t handle);
-const skiq_tx_param_t &txParamForHandle(const skiq_param_t &param,
-                                        const skiq_tx_hdl_t handle);
 
 
 class SoapySidekiq : public SoapySDR::Device

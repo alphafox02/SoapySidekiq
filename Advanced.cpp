@@ -3,6 +3,7 @@
 // Device-wide user calibration files are handled here as well.
 
 #include "SoapySidekiq.hpp"
+#include "SidekiqUtils.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -12,7 +13,7 @@
 #include <string>
 #include <vector>
 
-bool equalsIgnoreCase(const std::string &a, const std::string &b);
+using namespace sidekiq;
 
 namespace
 {
