@@ -544,7 +544,7 @@ SoapySDR::Stream *SoapySidekiq::setupStream(const int direction,
                       skiq_rx_hdl_A2) != rx_stream_handles.end() ||
             std::find(rx_stream_handles.begin(), rx_stream_handles.end(),
                       skiq_rx_hdl_B2) != rx_stream_handles.end();
-        const skiq_chan_mode_t chan_mode = needs_dual_chan_mode
+        const skiq_chan_mode_t chan_mode = (needs_dual_chan_mode || tx_needs_dual_chan_mode)
                 ? skiq_chan_mode_dual
                 : skiq_chan_mode_single;
         status = skiq_write_chan_mode(card, chan_mode);
@@ -681,16 +681,79 @@ SoapySDR::Stream *SoapySidekiq::setupStream(const int direction,
         }
 
         //  check the channel configuration
-        if (channels.size() > 1)
+        if (channels.size() > 2)
         {
-            throw std::runtime_error("only one TX channel is supported simultaneously");
+            throw std::runtime_error("at most two TX channels can stream together");
         }
 
         const size_t tx_soapy_channel =
             channels.empty() ? DEFAULT_CHANNEL : channels.at(0);
         tx_hdl = txHandleForChannel(tx_soapy_channel);
+        tx_primary_hdl = tx_hdl;
+        tx_dual = channels.size() == 2;
+        tx_stream_block_size = current_tx_block_size;
 
-        SoapySDR_logf(SOAPY_SDR_INFO, "The TX handle is: %u", tx_hdl);
+        if (tx_dual)
+        {
+            // Dual-channel TX per the Sidekiq SDK manual: A1 with A2 or B1,
+            // one packet carrying both channels, driven by the second handle.
+            if (num_tx_channels < 2)
+            {
+                throw std::runtime_error("this card has " + std::to_string(num_tx_channels) +
+                                         " TX channel; two-channel TX is not available");
+            }
+            const skiq_tx_hdl_t second = txHandleForChannel(channels.at(1));
+            if (tx_primary_hdl != skiq_tx_hdl_A1 ||
+                (second != skiq_tx_hdl_A2 && second != skiq_tx_hdl_B1))
+            {
+                throw std::runtime_error("two-channel TX pairs handle A1 with A2 or B1 "
+                                         "(channels " + std::to_string(channels.at(0)) + "," +
+                                         std::to_string(channels.at(1)) + " map to " +
+                                         txHandleName(tx_primary_hdl) + "," +
+                                         txHandleName(second) + ")");
+            }
+            tx_hdl = second;
+
+            // packet = header + two channels of samples, a multiple of 256
+            // words that fits the FPGA TX FIFO
+            const auto dual_block_valid = [this](const uint32_t samples)
+            {
+                const uint32_t words = 2 * samples + SKIQ_TX_HEADER_SIZE_IN_WORDS;
+                const skiq_fpga_tx_fifo_size_t fifo = this->param.fpga_param.tx_fifo_size;
+                const uint32_t fifo_words = fifo == skiq_fpga_tx_fifo_size_unknown
+                    ? UINT32_MAX : (2048u << static_cast<unsigned>(fifo));
+                return words % 256 == 0 && words <= fifo_words;
+            };
+            if (!tx_block_size_from_args)
+            {
+                tx_stream_block_size = 8190;     // 16384-word packets
+                while (!dual_block_valid(tx_stream_block_size) && tx_stream_block_size > 126)
+                {
+                    tx_stream_block_size = (tx_stream_block_size - 2) / 2;
+                }
+            }
+            if (!dual_block_valid(tx_stream_block_size))
+            {
+                throw std::runtime_error("tx_block_size " + std::to_string(tx_stream_block_size) +
+                                         " is not valid for two-channel TX: 2 x block size + " +
+                                         std::to_string(SKIQ_TX_HEADER_SIZE_IN_WORDS) +
+                                         " must be a multiple of 256 and fit the FPGA FIFO "
+                                         "(e.g. 1022, 2046 or 8190)");
+            }
+
+            status = skiq_write_chan_mode(card, skiq_chan_mode_dual);
+            if (status != 0)
+            {
+                throw std::runtime_error("failed to enable dual channel mode for TX (status " +
+                                         std::to_string(status) + ")");
+            }
+            tx_needs_dual_chan_mode = true;
+        }
+
+        SoapySDR_logf(SOAPY_SDR_INFO, "TX handle%s: %s%s%s, %u samples per block%s",
+                      tx_dual ? "s" : "", txHandleName(tx_primary_hdl),
+                      tx_dual ? " + " : "", tx_dual ? txHandleName(tx_hdl) : "",
+                      tx_stream_block_size, tx_dual ? " per channel" : "");
 
         if (format == "CS16")
         {
@@ -709,24 +772,33 @@ SoapySDR::Stream *SoapySidekiq::setupStream(const int direction,
                 "' -- Only CS16 or CF32 is supported by SoapySidekiq TX module.");
         }
 
-        // Program the selected TX handle with cached/default parameters.
+        // Program the TX handle(s) with cached/default parameters; both
+        // channels of a dual stream run at the primary channel's rate.
         const uint32_t stream_sample_rate =
-            tx_sample_rate_by_handle[tx_hdl] == 0 ? DEFAULT_SAMPLE_RATE
-                                                  : tx_sample_rate_by_handle[tx_hdl];
+            tx_sample_rate_by_handle[tx_primary_hdl] == 0 ? DEFAULT_SAMPLE_RATE
+                                                          : tx_sample_rate_by_handle[tx_primary_hdl];
         const uint32_t stream_bandwidth =
-            tx_bandwidth_by_handle[tx_hdl] == 0
+            tx_bandwidth_by_handle[tx_primary_hdl] == 0
                 ? std::min<uint32_t>(DEFAULT_BANDWIDTH, stream_sample_rate)
-                : tx_bandwidth_by_handle[tx_hdl];
-        if (!tx_rate_from_profile[tx_hdl])
+                : tx_bandwidth_by_handle[tx_primary_hdl];
+        for (size_t i = 0; i < txStreamChannels(); i++)
         {
-            writeTxSampleRateAndBandwidth(tx_hdl, stream_sample_rate, stream_bandwidth);
+            const size_t soapy_channel = tx_dual ? channels.at(i) : tx_soapy_channel;
+            const skiq_tx_hdl_t handle = txHandleForChannel(soapy_channel);
+            if (!tx_rate_from_profile[handle])
+            {
+                writeTxSampleRateAndBandwidth(handle, stream_sample_rate, stream_bandwidth);
+            }
+            if (!txHandleHopping(handle))
+            {
+                setFrequency(SOAPY_SDR_TX, soapy_channel,
+                             tx_center_frequency == 0 ? DEFAULT_FREQUENCY
+                                                      : tx_center_frequency);
+            }
         }
-        if (!txHandleHopping(tx_hdl))
-        {
-            setFrequency(SOAPY_SDR_TX, tx_soapy_channel,
-                         tx_center_frequency == 0 ? DEFAULT_FREQUENCY
-                                                  : tx_center_frequency);
-        }
+        // setFrequency() moves tx_hdl; the stream is driven by the second
+        // handle of a dual stream
+        tx_hdl = tx_dual ? txHandleForChannel(channels.at(1)) : tx_primary_hdl;
 
         status = skiq_read_sys_timestamp_freq(this->card, &this->sys_freq);
         if (status != 0)
@@ -740,7 +812,7 @@ SoapySDR::Stream *SoapySidekiq::setupStream(const int direction,
         // Allocate buffers only once the hardware accepted the configuration,
         // so a rejected rate does not leak them
         tx_bytes_per_sample = txUseShort ? sizeof(int16_t) * 2 : sizeof(float) * 2;
-        tx_staging_buffer.resize(tx_bytes_per_sample * current_tx_block_size);
+        tx_staging_buffer.resize(txStagingBytesPerChannel() * txStreamChannels());
         tx_staging_fill = 0;
 
         for (int i = 0; i < DEFAULT_NUM_TX_BUFFERS; i++)
@@ -750,7 +822,7 @@ SoapySDR::Stream *SoapySidekiq::setupStream(const int direction,
             tx_contexts[i].classAddr = this;
             tx_contexts[i].txIndex = static_cast<uint32_t>(i);
 
-            p_tx_block[i] = skiq_tx_block_allocate(current_tx_block_size);
+            p_tx_block[i] = skiq_tx_block_allocate(tx_stream_block_size * txStreamChannels());
             if (p_tx_block[i] == NULL)
             {
                 for (int j = 0; j < i; j++)
@@ -815,6 +887,12 @@ void SoapySidekiq::closeStream(SoapySDR::Stream *stream)
         tx_staging_fill = 0;
         tx_bytes_per_sample = 0;
         tx_stream_setup = false;
+        if (tx_dual)
+        {
+            tx_dual = false;
+            tx_needs_dual_chan_mode = false;
+            tx_hdl = tx_primary_hdl;
+        }
     }
 }
 
@@ -828,7 +906,8 @@ size_t SoapySidekiq::getStreamMTU(SoapySDR::Stream *stream) const
     }
     else if (stream == TX_STREAM)
     {
-        return current_tx_block_size;
+        // samples per channel in each block
+        return tx_stream_block_size;
     }
     else
     {
@@ -990,9 +1069,12 @@ int SoapySidekiq::activateStream(SoapySDR::Stream *stream,
 
         p_tx_block_index = 0;
 
-        //  tx block size
-        status =
-            skiq_write_tx_block_size(card, tx_hdl, current_tx_block_size);
+        //  tx block size (per channel for a dual stream)
+        status = skiq_write_tx_block_size(card, tx_hdl, tx_stream_block_size);
+        if (status == 0 && tx_dual)
+        {
+            status = skiq_write_tx_block_size(card, tx_primary_hdl, tx_stream_block_size);
+        }
         if (status != 0)
         {
             SoapySDR_logf(SOAPY_SDR_ERROR,
@@ -1000,7 +1082,7 @@ int SoapySidekiq::activateStream(SoapySDR::Stream *stream,
                           card, status);
             throw std::runtime_error("");
         }
-        SoapySDR_logf(SOAPY_SDR_INFO, "TX block size is: %u", current_tx_block_size);
+        SoapySDR_logf(SOAPY_SDR_INFO, "TX block size is: %u", tx_stream_block_size);
 
         //  tx data flow mode: immediate, or held until each block's timestamp
         const skiq_tx_flow_mode_t flow_mode =
@@ -1046,6 +1128,10 @@ int SoapySidekiq::activateStream(SoapySDR::Stream *stream,
                           tx_timed_mode == TX_TIMED_ALLOW_LATE ? ", late blocks sent" : "");
         }
         status = skiq_write_tx_data_flow_mode(card, tx_hdl, flow_mode);
+        if (status == 0 && tx_dual)
+        {
+            status = skiq_write_tx_data_flow_mode(card, tx_primary_hdl, flow_mode);
+        }
         if (status != 0)
         {
             SoapySDR_logf(
@@ -1654,7 +1740,8 @@ int SoapySidekiq::transmitBlock(const uint8_t *inbuff_ptr,
     }
 
     uint8_t *outbuff_ptr = (uint8_t *)p_tx_block[currTXBuffIndex]->data;
-    const size_t tx_block_bytes = current_tx_block_size * sizeof(int16_t) * 2;
+    const size_t tx_block_samples = static_cast<size_t>(tx_stream_block_size) * txStreamChannels();
+    const size_t tx_block_bytes = tx_block_samples * sizeof(int16_t) * 2;
 
     if (txUseShort)
     {
@@ -1666,7 +1753,7 @@ int SoapySidekiq::transmitBlock(const uint8_t *inbuff_ptr,
         int16_t *short_outbuff = reinterpret_cast<int16_t *>(outbuff_ptr);
         const float scale = static_cast<float>(txFullScaleForHandle(tx_hdl));
 
-        for (size_t i = 0; i < current_tx_block_size * 2; i++)
+        for (size_t i = 0; i < tx_block_samples * 2; i++)
         {
             float v = float_inbuff[i] * scale;
             v = std::max(-32768.0f, std::min(32767.0f, v));
@@ -1692,7 +1779,7 @@ int SoapySidekiq::transmitBlock(const uint8_t *inbuff_ptr,
             currTXBuffIndex = (currTXBuffIndex + 1) % DEFAULT_NUM_TX_BUFFERS;
             if (tx_timed_mode != TX_TIMED_OFF)
             {
-                tx_next_timestamp += current_tx_block_size *
+                tx_next_timestamp += tx_stream_block_size *
                     (tx_timed_rf ? 1.0 : static_cast<double>(sys_freq) /
                                          tx_sample_rate_by_handle[tx_hdl]);
             }
@@ -1747,9 +1834,13 @@ int SoapySidekiq::flushPartialTxBlock(const std::chrono::steady_clock::time_poin
     {
         return 0;
     }
-    memset(tx_staging_buffer.data() + tx_staging_fill, 0,
-           tx_staging_buffer.size() - tx_staging_fill);
-    tx_staging_fill = tx_staging_buffer.size();
+    const size_t per_channel = txStagingBytesPerChannel();
+    for (size_t ch = 0; ch < txStreamChannels(); ch++)
+    {
+        memset(tx_staging_buffer.data() + ch * per_channel + tx_staging_fill, 0,
+               per_channel - tx_staging_fill);
+    }
+    tx_staging_fill = per_channel;
     const int status = transmitBlock(tx_staging_buffer.data(), deadline);
     if (status == 0)
     {
@@ -1794,7 +1885,7 @@ int SoapySidekiq::writeStream(SoapySDR::Stream * stream,
     if (tx_bytes_per_sample == 0)
     {
         tx_bytes_per_sample = txUseShort ? sizeof(int16_t) * 2 : sizeof(float) * 2;
-        tx_staging_buffer.resize(tx_bytes_per_sample * current_tx_block_size);
+        tx_staging_buffer.resize(txStagingBytesPerChannel() * txStreamChannels());
     }
 
     if (tx_timed_mode != TX_TIMED_OFF)
@@ -1828,14 +1919,16 @@ int SoapySidekiq::writeStream(SoapySDR::Stream * stream,
         tx_time_ignored_warned = true;
     }
 
-    const uint8_t *input = reinterpret_cast<const uint8_t *>(buffs[0]);
+    // tx_staging_fill counts the bytes staged for each channel; a dual
+    // stream stages channel 0 then channel 1, as the packet carries them
+    const size_t per_channel = txStagingBytesPerChannel();
     size_t consumed = 0;
 
     while (true)
     {
         // a full staging block (possibly left from a call that timed out)
         // has to go out before more samples can be taken
-        if (tx_staging_fill == tx_staging_buffer.size())
+        if (tx_staging_fill == per_channel)
         {
             const int status = transmitBlock(tx_staging_buffer.data(), deadline);
             if (status != 0)
@@ -1850,13 +1943,16 @@ int SoapySidekiq::writeStream(SoapySDR::Stream * stream,
             break;
         }
 
-        const size_t space_samples =
-            (tx_staging_buffer.size() - tx_staging_fill) / tx_bytes_per_sample;
+        const size_t space_samples = (per_channel - tx_staging_fill) / tx_bytes_per_sample;
         const size_t chunk = std::min(space_samples, numElems - consumed);
 
-        memcpy(tx_staging_buffer.data() + tx_staging_fill,
-               input + consumed * tx_bytes_per_sample,
-               chunk * tx_bytes_per_sample);
+        for (size_t ch = 0; ch < txStreamChannels(); ch++)
+        {
+            const uint8_t *input = reinterpret_cast<const uint8_t *>(buffs[ch]);
+            memcpy(tx_staging_buffer.data() + ch * per_channel + tx_staging_fill,
+                   input + consumed * tx_bytes_per_sample,
+                   chunk * tx_bytes_per_sample);
+        }
 
         tx_staging_fill += chunk * tx_bytes_per_sample;
         consumed += chunk;

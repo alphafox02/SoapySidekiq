@@ -202,7 +202,7 @@ RX supports `CS16` and `CF32` streams. TX accepts `CS16` and `CF32`, with
 `CF32` converted to Sidekiq `CS16` internally.
 
 Multi-channel RX uses the non-conflicting RX handles reported by the Sidekiq
-SDK. TX supports one channel per active TX stream.
+SDK. TX streams one channel, or two on cards with dual-channel transmit.
 
 The driver buffers received samples for applications that briefly fall
 behind: 500 ms per channel at the stream's sample rate by default. Change it
@@ -211,6 +211,21 @@ application falls further behind than that, samples are dropped and the next
 `readStream()` call at the gap returns `SOAPY_SDR_OVERFLOW`; the same happens
 for any other discontinuity, such as retuning while streaming. Samples
 returned by a single `readStream()` call are always contiguous.
+
+Timed TX bursts need the `tx_timestamps` TX stream argument (`true`, or
+`allow_late` to send late data instead of dropping it). `writeStream()` then
+honors `SOAPY_SDR_HAS_TIME` (the burst starts at `timeNs`) and
+`SOAPY_SDR_END_BURST` (the last partial block is sent, zero padded), and
+`readStreamStatus()` reports dropped late blocks as `SOAPY_SDR_TIME_ERROR`.
+Times follow the `timetype` setting: `rf_timestamp` (default; the TX sample
+counter, the same timebase as `readStream()` when RX and TX run at the same
+rate) or `sys_timestamp`, where the card supports it.
+
+Two TX channels can stream together on cards with dual-channel transmit
+(A1 with A2 or B1, e.g. X4, NV100, NVM2): `setupStream(SOAPY_SDR_TX, fmt,
+[0, 1])`. Both channels share the sample rate, and each block carries 8190
+samples per channel by default (with `tx_block_size`, 2 x size + 4 must be a
+multiple of 256).
 
 Passing `SOAPY_SDR_HAS_TIME` to `activateStream()` starts the stream on the
 next 1PPS edge. For TX, `writeStream()` accepts samples once the stream has

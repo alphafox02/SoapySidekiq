@@ -529,6 +529,7 @@ SoapySidekiq::SoapySidekiq(const SoapySDR::Kwargs &args)
     if (args.count("tx_block_size") != 0)
     {
         current_tx_block_size = std::stoi(args.at("tx_block_size"));
+        tx_block_size_from_args = true;
     }
     else
     {

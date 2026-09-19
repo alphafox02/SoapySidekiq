@@ -484,6 +484,20 @@ class SoapySidekiq : public SoapySDR::Device
         // incremented from libsidekiq's TX completion threads
         std::atomic<uint32_t> complete_count{};
         uint32_t current_tx_block_size{};
+        bool tx_block_size_from_args{};
+        // TX stream layout.  Dual-channel TX (A1 with A2 or B1) sends one
+        // packet per block holding tx_stream_block_size samples for the
+        // primary handle followed by the same number for the second; the
+        // second handle (tx_hdl) starts, stops and transmits the stream.
+        bool tx_dual{};
+        bool tx_needs_dual_chan_mode{};
+        skiq_tx_hdl_t tx_primary_hdl{};
+        uint32_t tx_stream_block_size{};
+        size_t txStreamChannels(void) const { return tx_dual ? 2 : 1; }
+        size_t txStagingBytesPerChannel(void) const
+        {
+            return tx_bytes_per_sample * tx_stream_block_size;
+        }
 
         //  setting
         bool iq_swap{};
