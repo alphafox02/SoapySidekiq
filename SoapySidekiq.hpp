@@ -45,6 +45,18 @@
 #define SOAPYSIDEKIQ_HAS_SDK_NVM2_PART 0
 #endif
 
+// GPSDO control arrived in libsidekiq v4.15.0; the lock query in v4.17.0.
+#if defined(LIBSIDEKIQ_VERSION) && (LIBSIDEKIQ_VERSION >= 41500)
+#define SOAPYSIDEKIQ_HAS_SDK_GPSDO 1
+#else
+#define SOAPYSIDEKIQ_HAS_SDK_GPSDO 0
+#endif
+#if defined(LIBSIDEKIQ_VERSION) && (LIBSIDEKIQ_VERSION >= 41700)
+#define SOAPYSIDEKIQ_HAS_SDK_GPSDO_LOCK 1
+#else
+#define SOAPYSIDEKIQ_HAS_SDK_GPSDO_LOCK 0
+#endif
+
 // Topology management and the Matchstiq Z4 part types arrived in libsidekiq
 // v4.26.0.  Older SDKs still build; the topology device argument is ignored.
 #if defined(LIBSIDEKIQ_VERSION) && (LIBSIDEKIQ_VERSION >= 42600)
@@ -326,6 +338,15 @@ class SoapySidekiq : public SoapySDR::Device
         skiq_tx_hdl_t txHandleForChannel(const size_t channel) const;
         size_t mappedRxChannel(const size_t channel) const;
         void applyTopology(const uint8_t topology_id);
+
+        // On-board GPS (Sidekiq Stretch): the sidekiq_gps kernel module
+        // exposes control and status in /sys/fs/skiq_gps/<card>/.
+        std::string gpsSysfsPath(const std::string &entry) const;
+        bool gpsSysfsAvailable(void) const;
+        std::string readGpsSysfs(const std::string &entry) const;
+        void writeGpsSysfs(const std::string &entry, const std::string &value) const;
+        bool gpsdoSupported(void) const;
+        bool gpsdoEnabled(void) const;
         void writeTxSampleRateAndBandwidth(const skiq_tx_hdl_t handle,
                                            const uint32_t sample_rate,
                                            const uint32_t bandwidth);

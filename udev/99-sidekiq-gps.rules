@@ -1,0 +1,5 @@
+# Let members of the plugdev group control the Sidekiq Stretch's on-board GPS
+# (antenna bias and module power) without root.  The sidekiq_gps kernel module
+# creates /sys/fs/skiq_gps/<card>/ when its platform device binds.
+ACTION=="bind", SUBSYSTEM=="platform", DRIVER=="skiq_gps", KERNEL=="skiq_gps.*", \
+  RUN+="/bin/sh -c 'for f in ant_bias_en power_en_n; do p=/sys/fs/skiq_gps/%n/$f; chgrp plugdev $p && chmod 0664 $p; done'"

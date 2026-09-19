@@ -1,5 +1,77 @@
 #include "SoapySidekiq.hpp"
 
+#include <cerrno>
+#include <cstring>
+#include <fstream>
+#include <sstream>
+#include <sys/stat.h>
+
+std::string SoapySidekiq::gpsSysfsPath(const std::string &entry) const
+{
+    return "/sys/fs/skiq_gps/" + std::to_string(card) + "/" + entry;
+}
+
+bool SoapySidekiq::gpsSysfsAvailable(void) const
+{
+    struct stat info;
+    return stat(gpsSysfsPath("ant_bias_en").c_str(), &info) == 0;
+}
+
+std::string SoapySidekiq::readGpsSysfs(const std::string &entry) const
+{
+    std::ifstream input(gpsSysfsPath(entry));
+    std::string value;
+    if (!input.is_open() || !std::getline(input, value))
+    {
+        throw std::runtime_error("cannot read " + gpsSysfsPath(entry) +
+                                 " (is the sidekiq_gps kernel module loaded?)");
+    }
+    return value;
+}
+
+void SoapySidekiq::writeGpsSysfs(const std::string &entry, const std::string &value) const
+{
+    const std::string path = gpsSysfsPath(entry);
+    std::ofstream output(path);
+    if (output.is_open())
+    {
+        output << value;
+        output.flush();
+    }
+    if (!output.is_open() || !output.good())
+    {
+        const int error = errno;
+        std::string message = "cannot write " + path + ": " + std::strerror(error);
+        if (error == EACCES || error == EPERM)
+        {
+            message += "; the sidekiq_gps sysfs entries are root-owned, so run as root "
+                       "or grant write access (see the SoapySidekiq README)";
+        }
+        throw std::runtime_error(message);
+    }
+}
+
+bool SoapySidekiq::gpsdoSupported(void) const
+{
+#if SOAPYSIDEKIQ_HAS_SDK_GPSDO
+    skiq_gpsdo_support_t support = skiq_gpsdo_support_unknown;
+    return skiq_is_gpsdo_supported(card, &support) == 0 &&
+           support == skiq_gpsdo_support_is_supported;
+#else
+    return false;
+#endif
+}
+
+bool SoapySidekiq::gpsdoEnabled(void) const
+{
+#if SOAPYSIDEKIQ_HAS_SDK_GPSDO
+    bool enabled = false;
+    return gpsdoSupported() && skiq_gpsdo_is_enabled(card, &enabled) == 0 && enabled;
+#else
+    return false;
+#endif
+}
+
 std::vector<std::string> SoapySidekiq::listSensors(void) const
 {
     std::vector<std::string> sensors;
@@ -7,6 +79,17 @@ std::vector<std::string> SoapySidekiq::listSensors(void) const
 
     sensors.push_back("temperature");
     sensors.push_back("accelerometer");
+    if (gpsSysfsAvailable())
+    {
+        sensors.push_back("gps_fix");
+    }
+    if (gpsdoSupported())
+    {
+#if SOAPYSIDEKIQ_HAS_SDK_GPSDO_LOCK
+        sensors.push_back("gpsdo_locked");
+#endif
+        sensors.push_back("gpsdo_freq_accuracy");
+    }
 
     return sensors;
 }
@@ -28,6 +111,26 @@ SoapySDR::ArgInfo SoapySidekiq::getSensorInfo(const std::string &key) const
         info.name = "Accelerometer";
         info.description = "Raw accelerometer axes as a JSON object {\"x\":..,\"y\":..,\"z\":..}";
         info.type = SoapySDR::ArgInfo::STRING;
+    }
+    else if (key == "gps_fix")
+    {
+        info.name = "GPS Fix";
+        info.description = "On-board GPS receiver has a position fix";
+        info.type = SoapySDR::ArgInfo::BOOL;
+    }
+    else if (key == "gpsdo_locked")
+    {
+        info.name = "GPSDO Locked";
+        info.description = "Reference oscillator is locked to GPS (clock source \"gpsdo\")";
+        info.type = SoapySDR::ArgInfo::BOOL;
+    }
+    else if (key == "gpsdo_freq_accuracy")
+    {
+        info.name = "GPSDO Accuracy";
+        info.description = "Reference frequency accuracy while disciplined by GPS; "
+                           "empty when the GPSDO is not enabled or not locked";
+        info.units = "ppm";
+        info.type = SoapySDR::ArgInfo::FLOAT;
     }
     else
     {
@@ -123,6 +226,36 @@ std::string SoapySidekiq::readSensor(const std::string &key) const
         SoapySDR_logf(SOAPY_SDR_DEBUG, "accel data %s", (ss.str().c_str()));
         return ss.str();
     }
+
+    if (key == "gps_fix")
+    {
+        return readGpsSysfs("has_fix") == "1" ? "true" : "false";
+    }
+
+#if SOAPYSIDEKIQ_HAS_SDK_GPSDO_LOCK
+    if (key == "gpsdo_locked")
+    {
+        bool locked = false;
+        status = skiq_gpsdo_is_locked(card, &locked);
+        return (status == 0 && locked) ? "true" : "false";
+    }
+#endif
+
+#if SOAPYSIDEKIQ_HAS_SDK_GPSDO
+    if (key == "gpsdo_freq_accuracy")
+    {
+        double ppm = 0;
+        status = skiq_gpsdo_read_freq_accuracy(card, &ppm);
+        if (status != 0)
+        {
+            // not enabled or not locked yet: no measurement to report
+            return "";
+        }
+        std::ostringstream stream;
+        stream << ppm;
+        return stream.str();
+    }
+#endif
 
     SoapySDR_log(SOAPY_SDR_DEBUG, "sensor didn't match");
     return SoapySDR::Device::readSensor(key);

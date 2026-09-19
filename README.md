@@ -115,6 +115,32 @@ Soapy channel numbers select Sidekiq RX handles. Soapy antenna names select RF
 ports for the chosen handle. Use `SoapySDRUtil --probe` to inspect the mapping
 reported by the installed card, FPGA image, and `libsidekiq` runtime.
 
+### GPS and GPSDO (Sidekiq Stretch)
+
+On cards with an on-board GPS, the driver exposes the controls from Epiq's
+`sidekiq_gps` kernel module (`/sys/fs/skiq_gps/<card>/`):
+
+- `gps_antenna_bias` setting and device argument: the 3.3 V bias on the GPS
+  antenna port for an active GPS antenna, e.g.
+  `driver=sidekiq,card=0,gps_antenna_bias=true`
+- `gps_power` setting: power to the GPS module
+- `gps_fix` sensor: the GPS has a position fix
+
+On cards that support a GPS-disciplined oscillator (SDK v4.15.0 or newer), the
+`gpsdo` clock source disciplines the internal reference to GPS, and the
+`gpsdo_locked` and `gpsdo_freq_accuracy` (ppm) sensors report its state.
+
+The antenna bias is on by default, so an active GPS antenna works without any
+setup. The sysfs entries are writable only by root; to let applications
+running as a normal user change the GPS settings, install the provided udev
+rule, which gives the `plugdev` group write access whenever the card appears:
+
+```bash
+sudo cp udev/99-sidekiq-gps.rules /etc/udev/rules.d/
+sudo udevadm control --reload
+sudo udevadm trigger --action=bind --subsystem-match=platform --sysname-match='skiq_gps.*'
+```
+
 ### Topologies (Matchstiq Z4)
 
 Cards that support topologies (SDK v4.26.0 or newer) can be opened with a

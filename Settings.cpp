@@ -835,6 +835,11 @@ std::vector<ProfileEntry> nv100Profiles(const bool include_v424_rates,
         profile(61440000, handle_mask, 0)
     };
 
+#if defined(LIBSIDEKIQ_VERSION) && (LIBSIDEKIQ_VERSION >= 42600)
+    // listed in the v4.26 SDK manual's NV100/NVM2/G20/G40/Z4 rate table
+    profiles.push_back(profile(625000, handle_mask, 0));
+#endif
+
     if (include_v424_rates)
     {
         profiles.push_back(profile(160000, handle_mask, 0));
@@ -888,7 +893,17 @@ std::vector<ProfileEntry> rxProfilesForPart(const skiq_part_t part)
 #if SOAPYSIDEKIQ_HAS_SDK_NVM2_PART
         case skiq_nvm2:
 #endif
-            return nv100Profiles(libsidekiqAtLeast(4, 24, 0), RX_ALL_NV100);
+        {
+            std::vector<ProfileEntry> profiles =
+                nv100Profiles(libsidekiqAtLeast(4, 24, 0), RX_ALL_NV100);
+            // "disparate" rate: RX at 1.4 MS/s while TX runs at 5.6 MS/s
+            // (SDK manual, NV100/NVM2/G20/G40/Z4 disparate sample rates)
+            if (libsidekiqAtLeast(4, 17, 0))
+            {
+                profiles.push_back(profile(1400000, RX_ALL_NV100, 0));
+            }
+            return profiles;
+        }
 
         default:
             return {};
@@ -1584,6 +1599,11 @@ SoapySidekiq::SoapySidekiq(const SoapySDR::Kwargs &args)
     if (args.count("time_source") > 0) 
     {
         setTimeSource(args.at("time_source"));
+    }
+
+    if (args.count("gps_antenna_bias") > 0)
+    {
+        writeSetting("gps_antenna_bias", args.at("gps_antenna_bias"));
     }
 
 
@@ -3948,6 +3968,26 @@ SoapySDR::ArgInfoList SoapySidekiq::getSettingInfo(void) const
     settingArg.type        = SoapySDR::ArgInfo::STRING;
     setArgs.push_back(settingArg);
 
+    if (gpsSysfsAvailable())
+    {
+        settingArg.options.clear();
+        settingArg.key         = "gps_antenna_bias";
+        settingArg.value       = "true";
+        settingArg.name        = "GPS Antenna Bias";
+        settingArg.description = "3.3 V bias on the GPS antenna port for an active GPS antenna "
+                                 "(needs write access to /sys/fs/skiq_gps)";
+        settingArg.type        = SoapySDR::ArgInfo::BOOL;
+        setArgs.push_back(settingArg);
+
+        settingArg.key         = "gps_power";
+        settingArg.value       = "true";
+        settingArg.name        = "GPS Power";
+        settingArg.description = "Power to the on-board GPS module (needs write access to "
+                                 "/sys/fs/skiq_gps)";
+        settingArg.type        = SoapySDR::ArgInfo::BOOL;
+        setArgs.push_back(settingArg);
+    }
+
     settingArg.key         = "timetype";
     settingArg.value       = "rf_timestamp";
     settingArg.name        = "timetype";
@@ -4050,6 +4090,19 @@ void SoapySidekiq::writeSetting(const std::string &key,
             throw std::runtime_error("");
         }
     }
+    else if (equalsIgnoreCase(key, "gps_antenna_bias"))
+    {
+        writeGpsSysfs("ant_bias_en", (value == "true" || value == "1") ? "1" : "0");
+        SoapySDR_logf(SOAPY_SDR_INFO, "GPS antenna bias %s",
+                      (value == "true" || value == "1") ? "enabled" : "disabled");
+    }
+    else if (equalsIgnoreCase(key, "gps_power"))
+    {
+        // power_en_n is active low
+        writeGpsSysfs("power_en_n", (value == "true" || value == "1") ? "0" : "1");
+        SoapySDR_logf(SOAPY_SDR_INFO, "GPS module power %s",
+                      (value == "true" || value == "1") ? "enabled" : "disabled");
+    }
     else
     {
         SoapySDR_logf(SOAPY_SDR_WARNING, "writeSetting invalid key %s ", key.c_str());
@@ -4076,6 +4129,14 @@ std::string SoapySidekiq::readSetting(const std::string &key) const
     else if (equalsIgnoreCase(key, "sys_clock_freq"))
     {
         return std::to_string((uint64_t)this->sys_freq);
+    }
+    else if (equalsIgnoreCase(key, "gps_antenna_bias"))
+    {
+        return readGpsSysfs("ant_bias_en") == "1" ? "true" : "false";
+    }
+    else if (equalsIgnoreCase(key, "gps_power"))
+    {
+        return readGpsSysfs("power_en_n") == "0" ? "true" : "false";
     }
     else if (equalsIgnoreCase(key, "full_scale"))
     {
@@ -4584,6 +4645,11 @@ std::vector<std::string> SoapySidekiq::listClockSources(void) const
 
     result.push_back("external_clock");
     result.push_back("internal_clock");
+    if (gpsdoSupported())
+    {
+        // the internal reference, disciplined by the on-board GPS
+        result.push_back("gpsdo");
+    }
 
     return result;
 }
@@ -4594,6 +4660,11 @@ std::string SoapySidekiq::getClockSource(void) const
     skiq_ref_clock_select_t ref_clock = skiq_ref_clock_internal;
 
     SoapySDR_logf(SOAPY_SDR_TRACE, "getClockSource");
+
+    if (gpsdoEnabled())
+    {
+        return "gpsdo";
+    }
 
     status = skiq_read_ref_clock_select(card, &ref_clock);
     if (status != 0)
@@ -4627,6 +4698,43 @@ void SoapySidekiq::setClockSource(const std::string &source)
     skiq_ref_clock_select_t ref_clock = skiq_ref_clock_internal;
 
     SoapySDR_logf(SOAPY_SDR_TRACE, "setClockSource");
+
+#if SOAPYSIDEKIQ_HAS_SDK_GPSDO
+    const bool want_gpsdo = equalsIgnoreCase(source, "gpsdo");
+    if (want_gpsdo && !gpsdoSupported())
+    {
+        throw std::runtime_error("clock source \"gpsdo\" is not supported on this card");
+    }
+    if (!want_gpsdo && gpsdoEnabled())
+    {
+        status = skiq_gpsdo_disable(card);
+        if (status != 0)
+        {
+            SoapySDR_logf(SOAPY_SDR_WARNING,
+                          "skiq_gpsdo_disable failed (card %u), status %d", card, status);
+        }
+    }
+    if (want_gpsdo)
+    {
+        // the GPSDO disciplines the internal reference
+        status = skiq_write_ref_clock_select(card, skiq_ref_clock_internal);
+        if (status == 0)
+        {
+            status = skiq_gpsdo_enable(card);
+        }
+        if (status != 0)
+        {
+            SoapySDR_logf(SOAPY_SDR_ERROR,
+                          "enabling the GPSDO failed (card %u), status %d", card, status);
+            throw std::runtime_error("failed to enable the GPSDO (status " +
+                                     std::to_string(status) + ")");
+        }
+        SoapySDR_log(SOAPY_SDR_INFO,
+                     "ref_clock set to gpsdo; lock takes time after a GPS fix, "
+                     "see the gpsdo_locked sensor");
+        return;
+    }
+#endif
 
     if (equalsIgnoreCase(source, "internal_clock"))
     {
