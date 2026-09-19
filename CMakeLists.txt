@@ -112,6 +112,14 @@ if (SOAPYSIDEKIQ_BUILD_TESTS)
         target_link_libraries(${test_app} SoapySDR)
     endforeach()
 
+    # hardware-free unit tests for the internal helpers
+    add_executable(unit_tests tests/unit_tests.cpp SidekiqUtils.cpp)
+    target_include_directories(unit_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(unit_tests SoapySDR ${Sidekiq_LIBRARIES}
+                          ${CMAKE_DL_LIBS} ${OTHER_LIBS} ${PKGCONFIG_LIBS}
+                          ${Sidekiq_RUNTIME_LIBRARIES})
+    add_test(NAME unit_tests COMMAND unit_tests)
+
     if (SOAPYSIDEKIQ_ENABLE_HARDWARE_TESTS)
         add_test(NAME range_smoke COMMAND range_smoke)
         add_test(NAME antenna_smoke COMMAND antenna_smoke)
