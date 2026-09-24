@@ -265,6 +265,11 @@ The `tests/` directory contains Python examples and C++ smoke-test utilities:
 - `rx_multicard_cs16_validate`: multi-card RX validation
 - `antenna_smoke`: RF-port listing and switching checks
 - `range_smoke`: rate, bandwidth, frequency, gain, and native-scale checks
+- `soak`: long-running RX/TX check (sample continuity in counter mode, memory
+  and CPU over time, retunes, a slow reader and timed TX bursts).  Durations
+  come from the SOAK_STEADY_MIN, SOAK_RETUNE_MIN, SOAK_SLOW_MIN and SOAK_TX_MIN
+  environment variables (60/15/5/10 minutes by default); it transmits at
+  maximum attenuation
 
 `unit_tests` checks the driver's internal helpers (rate and bandwidth tables,
 gain conversions, handle mapping, validation) without any hardware:

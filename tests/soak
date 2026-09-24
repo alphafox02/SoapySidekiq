@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""Long-running soak test: sample integrity, memory and CPU over time."""
+import os
+import resource
+import sys
+import time
+import numpy as np
+import SoapySDR
+from SoapySDR import (SOAPY_SDR_RX, SOAPY_SDR_TX, SOAPY_SDR_CS16, SOAPY_SDR_OVERFLOW,
+                      SOAPY_SDR_HAS_TIME, SOAPY_SDR_END_BURST, SOAPY_SDR_TIME_ERROR)
+
+SoapySDR.setLogLevel(SoapySDR.SOAPY_SDR_WARNING)
+STEADY_MIN = float(os.environ.get("SOAK_STEADY_MIN", 60))
+RETUNE_MIN = float(os.environ.get("SOAK_RETUNE_MIN", 15))
+SLOW_MIN = float(os.environ.get("SOAK_SLOW_MIN", 5))
+TX_MIN = float(os.environ.get("SOAK_TX_MIN", 10))
+RATE = 30.72e6
+N = 16384
+fails = []
+
+
+def check(name, cond, detail=""):
+    print(f"{'PASS' if cond else 'FAIL'}  {name}  {detail}", flush=True)
+    if not cond:
+        fails.append(name)
+
+
+def rss_mb():
+    # current resident size; ru_maxrss is the peak and never falls
+    with open('/proc/self/status') as f:
+        for line in f:
+            if line.startswith('VmRSS:'):
+                return int(line.split()[1]) / 1024.0
+    return 0.0
+
+
+def cpu():
+    t = os.times()
+    return t.user + t.system
+
+
+class CounterCheck:
+    """The FPGA counter increments once per int16, Q before I, wrapping at 12 bits."""
+
+    def __init__(self):
+        self.prev = None
+        self.errors = 0
+        self.samples = 0
+
+    def feed(self, buf, count):
+        v = buf[0:2 * count].reshape(-1, 2)[:, ::-1].reshape(-1).astype(np.int32)
+        if self.prev is not None and (v[0] - self.prev) % 4096 != 1:
+            self.errors += 1
+        self.errors += int(np.count_nonzero(np.diff(v) % 4096 != 1))
+        self.prev = v[-1]
+        self.samples += count
+
+    def gap(self):
+        self.prev = None
+
+
+d = SoapySDR.Device("driver=sidekiq,card=0")
+d.setSampleRate(SOAPY_SDR_RX, 0, RATE)
+d.setFrequency(SOAPY_SDR_RX, 0, 915e6)
+d.writeSetting("counter", "true")
+st = d.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16, [0])
+d.activateStream(st)
+buf = np.empty(2 * N, np.int16)
+open_rss = rss_mb()
+# the RX ring becomes resident as it fills; take the baseline after that
+for _ in range(4000):
+    d.readStream(st, [buf], N, timeoutUs=1000000)
+start_rss = rss_mb()
+print(f"start: RSS {open_rss:.0f} MB at open, {start_rss:.0f} MB with the RX buffer resident, "
+      f"rate {RATE/1e6:g} MS/s, counter mode", flush=True)
+
+# ---- phase 1: steady streaming
+cc = CounterCheck()
+overflows = timeouts = 0
+t0 = time.time()
+cpu0 = cpu()
+next_report = 300
+while time.time() - t0 < STEADY_MIN * 60:
+    r = d.readStream(st, [buf], N, timeoutUs=1000000)
+    if r.ret == N:
+        cc.feed(buf, r.ret)
+    elif r.ret == SOAPY_SDR_OVERFLOW:
+        overflows += 1
+        cc.gap()
+    elif r.ret > 0:
+        cc.feed(buf, r.ret)
+    else:
+        timeouts += 1
+        cc.gap()
+    elapsed = time.time() - t0
+    if elapsed > next_report:
+        print(f"  t={elapsed/60:5.1f} min  {cc.samples/1e9:6.3f} Gsamples  errors {cc.errors}  "
+              f"overflows {overflows}  timeouts {timeouts}  RSS {rss_mb():.0f} MB  "
+              f"CPU {(cpu()-cpu0)/elapsed*100:.0f}%", flush=True)
+        next_report += 300
+elapsed = time.time() - t0
+check("steady RX: samples contiguous", cc.errors == 0,
+      f"{cc.samples/1e9:.3f} Gsamples in {elapsed/60:.1f} min, {cc.errors} errors, "
+      f"{overflows} overflows, {timeouts} timeouts")
+check("steady RX: rate sustained", cc.samples / elapsed > 0.98 * RATE,
+      f"{cc.samples/elapsed/1e6:.2f} MS/s")
+check("steady RX: no memory growth", rss_mb() - start_rss < 10,
+      f"{start_rss:.0f} -> {rss_mb():.0f} MB")
+
+# ---- phase 2: retunes and rate changes while streaming
+freqs = [433.92e6, 915e6, 1090e6, 2437e6]
+rates = [10e6, 20e6, 30.72e6]
+t0 = time.time()
+tunes = 0
+cc2 = CounterCheck()
+while time.time() - t0 < RETUNE_MIN * 60:
+    d.setFrequency(SOAPY_SDR_RX, 0, freqs[tunes % len(freqs)])
+    if tunes % 7 == 6:
+        d.setSampleRate(SOAPY_SDR_RX, 0, rates[(tunes // 7) % len(rates)])
+    tunes += 1
+    # a retune skips four counter values without a timestamp gap (libsidekiq,
+    # see the findings notes), so resynchronise the counter check after each
+    cc2.gap()
+    for _ in range(40):
+        r = d.readStream(st, [buf], N, timeoutUs=1000000)
+        if r.ret == N:
+            cc2.feed(buf, r.ret)
+        elif r.ret == SOAPY_SDR_OVERFLOW or r.ret < 0:
+            cc2.gap()
+check("retunes while streaming", cc2.errors <= tunes,
+      f"{tunes} retunes, {cc2.samples/1e6:.0f} Msamples, {cc2.errors} errors")
+check("memory steady after retunes", rss_mb() - start_rss < 10, f"RSS {rss_mb():.0f} MB")
+d.setSampleRate(SOAPY_SDR_RX, 0, RATE)
+
+# ---- phase 3: slow reader (deliberate overflows), then recovery
+t0 = time.time()
+slow_ovf = 0
+cc3 = CounterCheck()
+while time.time() - t0 < SLOW_MIN * 60:
+    r = d.readStream(st, [buf], N, timeoutUs=1000000)
+    if r.ret == SOAPY_SDR_OVERFLOW:
+        slow_ovf += 1
+        cc3.gap()
+    elif r.ret > 0:
+        cc3.feed(buf, r.ret)
+    time.sleep(0.02)
+check("slow reader: data between gaps stays contiguous", cc3.errors == 0,
+      f"{slow_ovf} overflows, {cc3.errors} errors")
+cc4 = CounterCheck()
+for _ in range(2000):
+    r = d.readStream(st, [buf], N, timeoutUs=1000000)
+    if r.ret == N:
+        cc4.feed(buf, r.ret)
+    elif r.ret == SOAPY_SDR_OVERFLOW or r.ret < 0:
+        cc4.gap()
+check("recovers after slow reader", cc4.errors == 0, f"{cc4.samples/1e6:.0f} Msamples")
+d.writeSetting("counter", "false")
+d.deactivateStream(st)
+d.closeStream(st)
+
+# ---- phase 4: TX at minimum power, timed bursts
+d.setSampleRate(SOAPY_SDR_TX, 0, 1e6)
+d.setFrequency(SOAPY_SDR_TX, 0, 915e6)
+d.setGain(SOAPY_SDR_TX, 0, "attenuation", d.getGainRange(SOAPY_SDR_TX, 0, "attenuation").maximum())
+if d.getGain(SOAPY_SDR_TX, 0, "attenuation") < 89:
+    sys.exit("TX attenuation not at maximum; stopping")
+tx = d.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CS16, [0], {"tx_timestamps": "true"})
+d.activateStream(tx)
+zeros = np.zeros(2 * 20000, np.int16)
+t0 = time.time()
+bursts = late = short = 0
+while time.time() - t0 < TX_MIN * 60:
+    t = d.getHardwareTime("tx_rf_timestamp") + 100_000_000
+    r = d.writeStream(tx, [zeros], 20000, SOAPY_SDR_HAS_TIME | SOAPY_SDR_END_BURST, t,
+                      timeoutUs=1000000)
+    if r.ret != 20000:
+        short += 1
+    bursts += 1
+    s = d.readStreamStatus(tx, timeoutUs=10000).ret
+    if s == SOAPY_SDR_TIME_ERROR:
+        late += 1
+    time.sleep(0.15)
+check("timed TX bursts accepted", short == 0, f"{bursts} bursts, {short} short writes")
+check("timed TX bursts not late", late == 0, f"{late} late")
+check("RX buffer released with the stream", rss_mb() < start_rss - 20,
+      f"{start_rss:.0f} MB streaming -> {rss_mb():.0f} MB after close")
+d.deactivateStream(tx)
+d.closeStream(tx)
+del d
+
+d = SoapySDR.Device("driver=sidekiq,card=0")
+check("device reopens after the soak", d.getHardwareKey() != "")
+del d
+
+print(f"\n{len(fails)} failure(s)" + (": " + ", ".join(fails) if fails else ""))
+sys.exit(1 if fails else 0)
