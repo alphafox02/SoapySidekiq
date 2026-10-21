@@ -19,6 +19,7 @@
 #define SoapySDR_log(...) ((void)0)
 using skiq_rx_hdl_t = unsigned;
 using skiq_tx_hdl_t = unsigned;
+constexpr skiq_rx_hdl_t skiq_rx_hdl_B1 = 2;
 enum skiq_part_t
 {
     skiq_mpcie,
@@ -200,7 +201,7 @@ class SoapySidekiq
     bool getGainMode(int, std::size_t) const;
     skiq_rx_hdl_t getRxHandle(std::size_t) const;
     skiq_tx_hdl_t getTxHandle(std::size_t) const;
-    GainProfile gainProfile() const;
+    GainProfile gainProfile(std::size_t) const;
     double txGainMaximum(std::size_t) const;
     void setGain(int, std::size_t, double);
     void setGain(int, std::size_t, const std::string &, double);
@@ -258,6 +259,74 @@ TEST_CASE("RX respects narrower and equal hardware index bounds")
     sdk.state[3].maximum = 200;
     device.setGain(SOAPY_SDR_RX, 0, 3);
     REQUIRE_EQ(sdk.state[3].gain, 200u);
+}
+TEST_CASE("X2 observation gain follows the mapped B1 handle rather than the channel index")
+{
+    for (const std::size_t channel : {std::size_t{0}, std::size_t{1}})
+    {
+        SoapySidekiq device;
+        device.part = skiq_x2;
+        device.param.rx_param[channel].handle = skiq_rx_hdl_B1;
+        // Inject an 18-step B1 table; its starting index comes from the SDK.
+        sdk.state[skiq_rx_hdl_B1].minimum = 100;
+        sdk.state[skiq_rx_hdl_B1].maximum = 118;
+        const auto range = device.getGainRange(SOAPY_SDR_RX, channel);
+        REQUIRE_EQ(range.minimum(), 0.0);
+        REQUIRE_EQ(range.maximum(), 18.0);
+        REQUIRE_EQ(range.step(), 1.0);
+        for (const double value : {-std::numeric_limits<double>::max(), -1.0, 0.0, 0.49, 0.5, 4.25,
+                                   17.6, 18.0, std::numeric_limits<double>::max()})
+        {
+            device.setGain(SOAPY_SDR_RX, channel, value);
+            const auto expected = std::round(std::clamp(value, 0.0, 18.0));
+            REQUIRE_EQ(sdk.handle, skiq_rx_hdl_B1);
+            REQUIRE_EQ(sdk.state[skiq_rx_hdl_B1].gain, static_cast<std::uint8_t>(100 + expected));
+            REQUIRE_EQ(device.getGain(SOAPY_SDR_RX, channel), expected);
+        }
+    }
+}
+TEST_CASE("X2 main and observation receivers retain different gain steps on one device")
+{
+    SoapySidekiq device;
+    device.part = skiq_x2;
+    device.param.rx_param[0].handle = skiq_rx_hdl_B1;
+    device.param.rx_param[1].handle = 0;
+    sdk.state[skiq_rx_hdl_B1].minimum = 237;
+    sdk.state[skiq_rx_hdl_B1].maximum = 255;
+    sdk.state[0].minimum = 195;
+    sdk.state[0].maximum = 255;
+    device.setGain(SOAPY_SDR_RX, 0, 4.25);
+    device.setGain(SOAPY_SDR_RX, 1, 4.25);
+    REQUIRE_EQ(sdk.state[skiq_rx_hdl_B1].gain, 241u);
+    REQUIRE_EQ(sdk.state[0].gain, 204u);
+    REQUIRE_EQ(device.getGain(SOAPY_SDR_RX, 0), 4.0);
+    REQUIRE_EQ(device.getGain(SOAPY_SDR_RX, 1), 4.5);
+    REQUIRE_EQ(device.getGainRange(SOAPY_SDR_RX, 0).step(), 1.0);
+    REQUIRE_EQ(device.getGainRange(SOAPY_SDR_RX, 1).step(), 0.5);
+}
+TEST_CASE("RX gain conversion and advertised ranges share the SDK index bounds")
+{
+    for (const auto &profile : profiles)
+    {
+        SoapySidekiq device;
+        device.configure(profile);
+        sdk.state[3].minimum = 100;
+        sdk.state[3].maximum = 110;
+        const auto range = device.getGainRange(SOAPY_SDR_RX, 0);
+        REQUIRE_EQ(range.minimum(), 0.0);
+        REQUIRE_EQ(range.maximum(), 10.0 / profile.steps);
+        REQUIRE_EQ(range.step(), 1.0 / profile.steps);
+        device.setGain(SOAPY_SDR_RX, 0, 0);
+        REQUIRE_EQ(sdk.state[3].gain, 100u);
+        REQUIRE_EQ(device.getGain(SOAPY_SDR_RX, 0), 0.0);
+        device.setGain(SOAPY_SDR_RX, 0, range.maximum());
+        REQUIRE_EQ(sdk.state[3].gain, 110u);
+        REQUIRE_EQ(device.getGain(SOAPY_SDR_RX, 0), range.maximum());
+        sdk.state[3].maximum = 100;
+        REQUIRE_EQ(device.getGainRange(SOAPY_SDR_RX, 0).maximum(), 0.0);
+        device.setGain(SOAPY_SDR_RX, 0, std::numeric_limits<double>::max());
+        REQUIRE_EQ(sdk.state[3].gain, 100u);
+    }
 }
 TEST_CASE("explicit RX gain switches automatic mode only after range validation")
 {

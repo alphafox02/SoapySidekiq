@@ -180,8 +180,10 @@ bool SoapySidekiq::getDCOffsetMode(const int direction, const size_t channel) co
  * Gain API
  ******************************************************************/
 
-SoapySidekiq::GainProfile SoapySidekiq::gainProfile() const
+SoapySidekiq::GainProfile SoapySidekiq::gainProfile(const size_t channel) const
 {
+    const auto handle = getRxHandle(channel);
+    double steps_per_db;
     switch (part)
     {
     case skiq_mpcie:
@@ -189,20 +191,37 @@ SoapySidekiq::GainProfile SoapySidekiq::gainProfile() const
     case skiq_m2_2280:
     case skiq_z2:
     case skiq_z3u:
-        return {0, 1, 76};
+        steps_per_db = 1;
+        break;
     case skiq_x2:
+        // X2 B1 is the observation receiver: its gain table uses 1 dB steps.
+        steps_per_db = handle == skiq_rx_hdl_B1 ? 1 : 2;
+        break;
     case skiq_x4:
     case skiq_x40:
-        return {195, 2, 30};
     case skiq_nv100:
     case skiq_nvm2:
     case skiq_z4:
     case skiq_z4_mp:
-        return {187, 2, 34};
+        steps_per_db = 2;
+        break;
     default:
         throw std::runtime_error("unsupported Sidekiq gain profile (card " + std::to_string(card) +
                                  ")");
     }
+
+    uint8_t minimum{}, maximum{};
+    const auto context = " (card " + std::to_string(card) + ", channel " + std::to_string(channel) +
+                         ", handle " + std::to_string(handle) + ")";
+    const int status = skiq_read_rx_gain_index_range(card, handle, &minimum, &maximum);
+    if (status != 0)
+        throw std::runtime_error("skiq_read_rx_gain_index_range" + context + " failed, status " +
+                                 std::to_string(status));
+    if (minimum > maximum)
+        throw std::runtime_error("invalid RX gain index range" + context);
+
+    // Use the same SDK bounds for zero gain, clamping, readback and metadata.
+    return {static_cast<double>(minimum), steps_per_db, (maximum - minimum) / steps_per_db};
 }
 
 double SoapySidekiq::txGainMaximum(const size_t channel) const
@@ -293,28 +312,20 @@ void SoapySidekiq::setGain(const int direction, const size_t channel, const doub
         " (card " + std::to_string(card) + ", channel " + std::to_string(channel) + ")";
     if (direction == SOAPY_SDR_RX)
     {
-        const auto profile = gainProfile();
+        const auto profile = gainProfile(channel);
         const auto handle = getRxHandle(channel);
-        uint8_t minimum{}, maximum{};
-        int status = skiq_read_rx_gain_index_range(card, handle, &minimum, &maximum);
-        if (status != 0)
-            throw std::runtime_error("skiq_read_rx_gain_index_range" + context +
-                                     " failed, status " + std::to_string(status));
-        if (minimum > maximum)
-            throw std::runtime_error("invalid RX gain index range" + context);
 
         // Clamp in the dB domain before multiplication/rounding and narrowing.
         // This also keeps even DBL_MAX requests from overflowing intermediate math.
-        const double bounded =
-            std::clamp(value, (minimum - profile.rx_offset) / profile.rx_steps_per_db,
-                       (maximum - profile.rx_offset) / profile.rx_steps_per_db);
+        const double bounded = std::clamp(value, 0.0, profile.rx_maximum);
         const double index = profile.rx_offset + std::round(bounded * profile.rx_steps_per_db);
         const auto gain_index = static_cast<uint8_t>(
-            std::clamp(index, static_cast<double>(minimum), static_cast<double>(maximum)));
+            std::clamp(index, profile.rx_offset,
+                       profile.rx_offset + profile.rx_maximum * profile.rx_steps_per_db));
 
         // Validate profile/range before changing hardware gain mode.
         skiq_rx_gain_t mode = skiq_rx_gain_manual;
-        status = skiq_read_rx_gain_mode(card, handle, &mode);
+        int status = skiq_read_rx_gain_mode(card, handle, &mode);
         if (status != 0)
             throw std::runtime_error("skiq_read_rx_gain_mode" + context + " failed, status " +
                                      std::to_string(status));
@@ -359,21 +370,15 @@ double SoapySidekiq::getGain(const int direction, const size_t channel) const
         " (card " + std::to_string(card) + ", channel " + std::to_string(channel) + ")";
     if (direction == SOAPY_SDR_RX)
     {
-        const auto profile = gainProfile();
+        const auto profile = gainProfile(channel);
         uint8_t index{};
         const auto handle = getRxHandle(channel);
-        uint8_t minimum{}, maximum{};
-        int status = skiq_read_rx_gain_index_range(card, handle, &minimum, &maximum);
-        if (status != 0)
-            throw std::runtime_error("skiq_read_rx_gain_index_range" + context +
-                                     " failed, status " + std::to_string(status));
-        if (minimum > maximum)
-            throw std::runtime_error("invalid RX gain index range" + context);
-        status = skiq_read_rx_gain(card, handle, &index);
+        const int status = skiq_read_rx_gain(card, handle, &index);
         if (status != 0)
             throw std::runtime_error("skiq_read_rx_gain" + context + " failed, status " +
                                      std::to_string(status));
-        if (index < minimum || index > maximum)
+        if (index < profile.rx_offset ||
+            index > profile.rx_offset + profile.rx_maximum * profile.rx_steps_per_db)
             throw std::runtime_error("RX gain readback is outside its index range" + context);
         return (index - profile.rx_offset) / profile.rx_steps_per_db;
     }
@@ -402,7 +407,7 @@ SoapySDR::Range SoapySidekiq::getGainRange(const int direction, const size_t cha
     validateChannel(direction, channel);
     if (direction == SOAPY_SDR_RX)
     {
-        const auto profile = gainProfile();
+        const auto profile = gainProfile(channel);
         return SoapySDR::Range(0, profile.rx_maximum, 1.0 / profile.rx_steps_per_db);
     }
     return SoapySDR::Range(0, txGainMaximum(channel), 0.25);

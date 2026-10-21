@@ -257,14 +257,14 @@ class SoapySidekiq : public SoapySDR::Device
     void validateGainName(int direction, size_t channel, const std::string &name) const;
     /** Read the configured RF port; empty when reporting is unavailable. */
     std::string currentAntenna(int direction, size_t channel) const;
-    /** Existing card-specific RX index conversion. */
+    /** RX index bounds and handle-specific conversion from the SDK gain table. */
     struct GainProfile
     {
         double rx_offset;
         double rx_steps_per_db;
         double rx_maximum;
     };
-    GainProfile gainProfile() const;
+    GainProfile gainProfile(size_t channel) const;
     double txGainMaximum(size_t channel) const;
     /** Validated SDK configuration; caches change only after complete readback. */
     struct RateAndBandwidth
