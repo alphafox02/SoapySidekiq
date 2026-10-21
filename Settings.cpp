@@ -5,6 +5,7 @@
 
 #include "SoapySidekiq.hpp"
 #include <SoapySidekiq/DeviceOptions.hpp>
+#include <SoapySidekiq/SdkCardManager.hpp>
 #include <SoapySidekiq/ScopeExit.hpp>
 #include <SoapySidekiq/SidekiqRxBackend.hpp>
 #include <SoapySidekiq/SampleScale.hpp>
@@ -219,20 +220,10 @@ SoapySidekiq::SoapySidekiq(const SoapySDR::Kwargs &args)
     current_tx_block_size = options.tx_block_size;
     SoapySDR_logf(SOAPY_SDR_INFO, "TX block size set to %u", current_tx_block_size);
 
-    skiq_xport_type_t type  = skiq_xport_type_auto;
-    skiq_xport_init_level_t level = skiq_xport_init_level_full;
-
     SoapySDR_logf(SOAPY_SDR_INFO, "Sidekiq opening card %u", card);
 
-    /* init sidekiq */
-    status = skiq_init(type, level, &card, 1);
-    if (status != 0)
-    {
-        SoapySDR_logf(SOAPY_SDR_ERROR, "skiq_init failed (card %u), status %d",
-                      card, status);
-        throw std::runtime_error("skiq_init failed (card " + std::to_string(card) + ", status " +
-                                 std::to_string(status) + ")");
-    }
+    // The SDK is global; each device owns only its selected card.
+    soapy_sidekiq::acquireSidekiqCard(card);
 
     // A throwing constructor never runs the device destructor. Only arm this
     // rollback after this call successfully acquires SDK initialization.
@@ -240,7 +231,7 @@ SoapySidekiq::SoapySidekiq(const SoapySDR::Kwargs &args)
         [this]() noexcept
         {
             p_tx_status.reset();
-            skiq_exit();
+            soapy_sidekiq::releaseSidekiqCard(card);
         });
     // The backend owns no hardware resource; the session owns its worker.
     rx_backend = std::make_unique<soapy_sidekiq::SidekiqRxBackend>(card);
@@ -438,7 +429,7 @@ SoapySidekiq::~SoapySidekiq(void)
 
     p_tx_status.reset();
 
-    skiq_exit();
+    soapy_sidekiq::releaseSidekiqCard(card);
 }
 
 /*******************************************************************

@@ -209,6 +209,13 @@ all affected handles; rollback failures are reported and require recovery.
 Timestamp selection accepts `rf_timestamp` or `sys_timestamp`; configure it
 before starting RX streaming.
 
+The module shares one libsidekiq initialization across its device objects and
+enables/disables each card separately. Closing or failing to open one card does
+not exit the SDK while another card remains owned. Independent device objects
+cannot own the same card simultaneously. An unrelated libsidekiq user in the
+same process must coordinate SDK lifetime separately; this module does not take
+over an SDK it did not initialize.
+
 Stream tokens belong to the device that created them and become invalid on
 close. Unknown tokens return `SOAPY_SDR_STREAM_ERROR` from activation,
 deactivation, I/O, and status calls. `closeStream` and `getStreamMTU` raise
@@ -277,3 +284,4 @@ an argument error.
 ## License
 
 - https://github.com/pothosware/SoapySidekiq/blob/master/LICENSE
+

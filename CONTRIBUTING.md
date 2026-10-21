@@ -84,7 +84,7 @@ cmake -S tests/non_hardware -B build/analysis \
   -DCMAKE_CXX_COMPILER=clang++-14 -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 run-clang-tidy-14 -p build/analysis -j 2 -quiet \
   -clang-tidy-binary clang-tidy-14 \
-  '/(DeviceDiscovery|DeviceOptions|SensorReader|StreamConfiguration|RxSampleQueue|RxStreamSession)\.cpp$'
+  '/(DeviceDiscovery|DeviceOptions|SensorReader|StreamConfiguration|RxSampleQueue|RxStreamSession|SdkCardManager)\.cpp$'
 ```
 
 The explicit correctness checks fail CI when found; compiler warnings are still

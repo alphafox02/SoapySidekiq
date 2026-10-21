@@ -123,3 +123,9 @@ cmake --build build/non_hardware-asan --parallel
 tests/run_logged.sh non_hardware_asan \
     tests/non_hardware/run_suite.sh build/non_hardware-asan
 ```
+
+The SDK card-manager tests exercise the production lifecycle coordinator with a
+fake backend: one library initialization across cards, per-card disable, failed
+second-card opens and constructor rollback, duplicate owners, concurrent opens,
+and disable/shutdown failures. These establish ownership ordering without the
+SDK; they do not replace a two-card capture in one process.

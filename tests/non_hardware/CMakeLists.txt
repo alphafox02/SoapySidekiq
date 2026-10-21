@@ -74,6 +74,15 @@ target_link_libraries(device_option_tests PRIVATE non_hardware_test_options)
 add_test(NAME device-options.all COMMAND device_option_tests)
 set_tests_properties(device-options.all PROPERTIES LABELS "unit;non-hardware")
 
+# Exercise global SDK lifetime without requiring proprietary headers or hardware.
+add_executable(sdk_card_manager_tests
+    support/TestMain.cpp unit/SdkCardManagerTests.cpp ../../SdkCardManager.cpp)
+target_include_directories(sdk_card_manager_tests PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/support" "${CMAKE_CURRENT_SOURCE_DIR}/../../include")
+target_link_libraries(sdk_card_manager_tests PRIVATE non_hardware_test_options Threads::Threads)
+add_test(NAME sdk-card-manager.all COMMAND sdk_card_manager_tests)
+set_tests_properties(sdk-card-manager.all PROPERTIES LABELS "unit;non-hardware")
+
 # Test sensor lifecycle and formatting without constructing a hardware device.
 add_executable(sensor_tests
     support/TestMain.cpp

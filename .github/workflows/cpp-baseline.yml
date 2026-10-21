@@ -107,7 +107,7 @@ jobs:
           clang-tidy-14 --dump-config > build/analysis/clang-tidy-config.yml
           run-clang-tidy-14 -p build/analysis -j 2 -quiet \
             -clang-tidy-binary clang-tidy-14 \
-            '/(DeviceDiscovery|DeviceOptions|SensorReader|StreamConfiguration|RxSampleQueue|RxStreamSession)\.cpp$' \
+            '/(DeviceDiscovery|DeviceOptions|SensorReader|StreamConfiguration|RxSampleQueue|RxStreamSession|SdkCardManager)\.cpp$' \
             | tee build/analysis/clang-tidy.log
       - name: Save analysis output
         if: always()

@@ -56,6 +56,8 @@ SOAPY_SDR_MODULE_UTIL(
         SoapySidekiq.hpp
         DeviceDiscovery.cpp
         DeviceOptions.cpp
+        SdkCardManager.cpp
+        SidekiqCardManager.cpp
         SensorReader.cpp
         SidekiqSensorBackend.cpp
         StreamConfiguration.cpp
