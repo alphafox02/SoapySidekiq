@@ -1,0 +1,73 @@
+NV100 contribution validation — 2026-10-21
+
+Environment
+Ubuntu 24.04.4 / DragonOS Noble, kernel 6.17.0-22-generic, x86_64.
+NV100 revision F0; FPGA 3.21.0; libsidekiq 4.26.0 g48d44c790.
+DMA driver 5.4.12.0 was used throughout. The installed 4.25 SDK symlink,
+/usr/lib/epiq, and loaded kernel modules were retained. A private x86_64 4.26
+SDK and separate module prefixes were used for the checks. DMA 5.4.13 was
+compiled for the exact kernel but was neither installed nor loaded.
+
+Soapy receive checks
+Source e8639151985cf59e5acbe209d9b1d4ebb1bbbb4b combines PRs 80–85.
+A1, A2, and B1 were tested separately in CS16 and CF32 at 5 MS/s with a
+4 MHz receive bandwidth. All six cases passed counter-payload ordering and
+continuity checks, timestamped 257-sample partial reads, explicit overflow
+following a deliberate 100 ms reader stall, and recovery to timestamped data.
+The initial harness needed an explicit tune after profile reconfiguration;
+its unset-LO failures were test setup errors, not driver regressions.
+
+The corrected check verifies at least 2056 samples per case. Actual sample
+counts: A1 CS16 2303 / CF32 2056; A2 CS16 2293 / CF32 2056;
+B1 CS16 2303 / CF32 2056. No initial overflow was observed in these runs.
+This does not establish simultaneous multi-channel support in SoapySidekiq.
+
+Independent SDK multi-channel baseline
+A receive-only SDK program captured both A1/B1 and A1/A2 at 5 MS/s.
+Each handle delivered 128 blocks, 130304 complex samples, with verified
+16-bit counter data, exact block timestamp continuity, and equal initial
+RF timestamps within each pair. This is a short DMA/counter/timestamp
+baseline; it does not establish RF phase coherence or long-run performance.
+The RX-only multi-start and multi-stop SDK APIs were used, without TX starts.
+
+SDK 4.26 metadata and constraints
+RX handles 0/1/2 correspond to A1/A2/B1; IQ resolution is 16 bits. Each reports
+sample-rate bounds 541667–61440000 S/s and RX gain indices 187–255.
+A2 conflicts with B1, and B1 conflicts with A2; A1 reports no RX conflict.
+The current independent topology has separate radio/port/duplex groups for
+A1+TX A1 and B1+TX B1, one shared sample-rate group containing both RX and TX
+pairs, and zero FPGA alignment groups. These are current-topology metadata,
+not a promise that groups have the same membership after a mode change.
+
+Topology support is reported true, with two advertised IDs (0 and 1), each
+listing two receivers and two transmitters. Explicit skiq_apply_topology()
+returned -95 (-ENOTSUP) for both IDs in this setup. The SDK legacy receive
+path passed despite that limitation. The cause has not been established;
+no inference is made about behavior with a different DMA driver or SDK build.
+Read-only group metadata works in the default unlocked configuration.
+
+Do not infer apply support from the support flag alone. The Soapy port must
+check SDK results, honor the A2/B1 conflict and shared-rate constraints, and
+use a single card-level receiver to dispatch all selected RX handles. Group
+radio start APIs can include TX members, so they cannot blindly replace
+RX-only start APIs.
+
+Profile-list correction
+PR 86 replaces the offset 250 kHz grid with the documented NV100/NVM2
+equal-rate built-in profiles, bounded by the SDK card/channel limits.
+Standalone source f71cd01 passed 387 normal and 387 ASan/UBSan cases,
+a complete SDK4.26 module build/load, and profile metadata checks on all three
+RX and TX handles. Each reported 30 bounded choices, including 5 MS/s and
+625 kS/s. NVM2 behavior is software-tested only; every listed rate has not
+been configured on hardware. Disparate/custom profiles are not enumerated.
+
+Combined source a74f8e1 passed 419 normal and 419 ASan/UBSan cases, a full
+SDK4.26 build/load on this host, and the same NV100 metadata checks. The
+receive checks above belong to e863915; a74f8e1 changes rate suggestions,
+not the receive path. GitHub CI for PR 86 was still queued at this checkpoint.
+
+Limits
+No TX streams, firmware flashing, kernel reload, or system SDK replacement
+were performed. GQRX, analog RF performance, two-card lifetime, timed/dual TX,
+and the new Soapy multi-channel implementation remain separate acceptance.
+The card was released and reported available after all checks.
