@@ -284,4 +284,3 @@ an argument error.
 ## License
 
 - https://github.com/pothosware/SoapySidekiq/blob/master/LICENSE
-
