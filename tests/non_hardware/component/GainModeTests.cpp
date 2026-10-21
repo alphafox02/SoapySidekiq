@@ -90,7 +90,8 @@ TEST_CASE("gain-mode capability reports RX control and manual-only TX without SD
         REQUIRE(!device.hasGainMode(SOAPY_SDR_TX, channel));
         const std::vector<std::string> expected{"LNA"};
         REQUIRE(device.listGains(SOAPY_SDR_RX, channel) == expected);
-        REQUIRE(device.listGains(SOAPY_SDR_TX, channel) == expected);
+        const std::vector<std::string> tx_expected{"LNA", "attenuation"};
+        REQUIRE(device.listGains(SOAPY_SDR_TX, channel) == tx_expected);
     }
     REQUIRE_EQ(sdk.reads, 0u);
     REQUIRE_EQ(sdk.writes, 0u);

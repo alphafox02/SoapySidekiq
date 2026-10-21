@@ -250,6 +250,8 @@ std::vector<std::string> SoapySidekiq::listGains(const int direction, const size
 {
     validateChannel(direction, channel);
     // Retain the existing element name for client compatibility.
+    if (direction == SOAPY_SDR_TX)
+        return {"LNA", "attenuation"};
     return {"LNA"};
 }
 
@@ -301,6 +303,21 @@ void SoapySidekiq::setGain(const int direction, const size_t channel, const std:
                            const double value)
 {
     validateGainName(direction, channel, name);
+    if (direction == SOAPY_SDR_TX && name == "attenuation")
+    {
+        const auto range = getGainRange(direction, channel, name);
+        if (!std::isfinite(value) || value < range.minimum() || value > range.maximum())
+            throw std::invalid_argument("TX attenuation is outside the SDK dB range");
+        const auto index = static_cast<uint16_t>(std::round(value * 4.0));
+        const auto handle = getTxHandle(channel);
+        const int status = skiq_write_tx_attenuation(card, handle, index);
+        if (status != 0)
+            throw std::runtime_error("skiq_write_tx_attenuation failed (card " +
+                                     std::to_string(card) + ", channel " + std::to_string(channel) +
+                                     ", handle " + std::to_string(handle) + ", status " +
+                                     std::to_string(status) + ")");
+        return;
+    }
     setGain(direction, channel, value);
 }
 
@@ -361,6 +378,9 @@ double SoapySidekiq::getGain(const int direction, const size_t channel,
                              const std::string &name) const
 {
     validateGainName(direction, channel, name);
+    if (direction == SOAPY_SDR_TX && name == "attenuation")
+        return static_cast<double>(param.tx_param[channel].atten_quarter_db_max) / 4.0 -
+               getGain(direction, channel);
     return getGain(direction, channel);
 }
 
@@ -400,6 +420,12 @@ SoapySDR::Range SoapySidekiq::getGainRange(const int direction, const size_t cha
 {
     validateGainName(direction, channel, name);
     SoapySDR_log(SOAPY_SDR_TRACE, "getGainRange with name");
+    if (direction == SOAPY_SDR_TX && name == "attenuation")
+    {
+        txGainMaximum(channel); // Validate the SDK metadata before exposing it.
+        return SoapySDR::Range(param.tx_param[channel].atten_quarter_db_min / 4.0,
+                               param.tx_param[channel].atten_quarter_db_max / 4.0, 0.25);
+    }
     return getGainRange(direction, channel);
 }
 

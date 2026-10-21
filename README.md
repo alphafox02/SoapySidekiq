@@ -170,6 +170,14 @@ The SDK can run selected calibrations during subsequent RX tuning operations.
 Automatic gain control is exposed for RX. TX uses manual attenuation and
 reports `hasGainMode()` as false; requesting TX automatic mode raises an error.
 
+TX exposes two views of the same attenuation control. The existing aggregate
+gain and named `LNA` element keep gain-style semantics: larger values reduce
+attenuation. The named `attenuation` element uses the SDK's direct dB semantics:
+larger values increase attenuation. Its range follows the selected handle's
+SDK limits in 0.25 dB steps; use `setGain(SOAPY_SDR_TX, channel, "attenuation", dB)`
+and the matching named `getGain()`/`getGainRange()` calls. These are aliases for
+one control, not independent gain stages.
+
 `setHardwareTime` accepts nonnegative nanoseconds with an empty/`now` selector
 for an immediate update or `1pps` for the next PPS. Conversion uses the system
 clock frequency and truncates fractional ticks with checked integer arithmetic.

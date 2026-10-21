@@ -481,6 +481,61 @@ TEST_CASE("named gain entry points share checked conversion and range reporting"
     REQUIRE_EQ(device.getGain(SOAPY_SDR_TX, 1, "LNA"), 4.25);
     REQUIRE_EQ(device.getGainRange(SOAPY_SDR_TX, 1, "LNA").maximum(), 89.75);
 }
+
+TEST_CASE("named TX attenuation uses direct quarter-dB SDK semantics while LNA stays compatible")
+{
+    SoapySidekiq device;
+    device.param.tx_param[1].atten_quarter_db_min = 10;
+    device.param.tx_param[1].atten_quarter_db_max = 110;
+    const auto range = device.getGainRange(SOAPY_SDR_TX, 1, "attenuation");
+    REQUIRE_EQ(range.minimum(), 2.5);
+    REQUIRE_EQ(range.maximum(), 27.5);
+    REQUIRE_EQ(range.step(), 0.25);
+    for (const double value : {2.5, 2.625, 12.625, 27.5})
+    {
+        device.setGain(SOAPY_SDR_TX, 1, "attenuation", value);
+        const auto index = static_cast<std::uint16_t>(std::round(value * 4));
+        REQUIRE_EQ(sdk.handle, 2u);
+        REQUIRE_EQ(sdk.state[2].attenuation, index);
+        REQUIRE_EQ(device.getGain(SOAPY_SDR_TX, 1, "attenuation"), index / 4.0);
+        REQUIRE_EQ(device.getGain(SOAPY_SDR_TX, 1, "LNA"), (110 - index) / 4.0);
+    }
+    device.setGain(SOAPY_SDR_TX, 1, "LNA", 0);
+    REQUIRE_EQ(device.getGain(SOAPY_SDR_TX, 1, "attenuation"), 27.5);
+    device.setGain(SOAPY_SDR_TX, 1, "LNA", 25);
+    REQUIRE_EQ(device.getGain(SOAPY_SDR_TX, 1, "attenuation"), 2.5);
+}
+
+TEST_CASE("named attenuation rejects invalid values metadata and RX use before SDK calls")
+{
+    SoapySidekiq device;
+    for (const double value :
+         {-1.0, 90.0, std::numeric_limits<double>::max(), std::numeric_limits<double>::quiet_NaN(),
+          std::numeric_limits<double>::infinity()})
+        REQUIRE_THROWS_AS(device.setGain(SOAPY_SDR_TX, 0, "attenuation", value),
+                          std::invalid_argument);
+    REQUIRE_THROWS_AS(device.setGain(SOAPY_SDR_RX, 0, "attenuation", 1), std::invalid_argument);
+    REQUIRE_THROWS_AS(device.getGain(SOAPY_SDR_RX, 0, "attenuation"), std::invalid_argument);
+    REQUIRE_THROWS_AS(device.getGainRange(SOAPY_SDR_RX, 0, "attenuation"), std::invalid_argument);
+    device.param.tx_param[0].atten_quarter_db_min = 100;
+    device.param.tx_param[0].atten_quarter_db_max = 50;
+    REQUIRE_THROWS_AS(device.setGain(SOAPY_SDR_TX, 0, "attenuation", 10), std::runtime_error);
+    REQUIRE_THROWS_AS(device.getGain(SOAPY_SDR_TX, 0, "attenuation"), std::runtime_error);
+    REQUIRE_THROWS_AS(device.getGainRange(SOAPY_SDR_TX, 0, "attenuation"), std::runtime_error);
+    REQUIRE(sdk.events.empty());
+}
+
+TEST_CASE("named attenuation reports SDK failures and rejects out-of-range readback")
+{
+    SoapySidekiq device;
+    sdk.fail_on = 'T';
+    REQUIRE_THROWS_AS(device.setGain(SOAPY_SDR_TX, 1, "attenuation", 10), std::runtime_error);
+    sdk.fail_on = 't';
+    REQUIRE_THROWS_AS(device.getGain(SOAPY_SDR_TX, 1, "attenuation"), std::runtime_error);
+    sdk.fail_on = {};
+    sdk.state[2].attenuation = 400;
+    REQUIRE_THROWS_AS(device.getGain(SOAPY_SDR_TX, 1, "attenuation"), std::runtime_error);
+}
 TEST_CASE("TX conversion safely spans the entire SDK uint16 attenuation field")
 {
     SoapySidekiq device;
