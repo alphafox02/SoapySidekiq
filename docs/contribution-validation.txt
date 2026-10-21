@@ -1,0 +1,51 @@
+Contribution checkpoint — 2026-10-21
+
+Upstream baseline: 92660c9f7c5fd3840c6d68e983f53964468cf7f9
+Original alphafox02 master retained: d5d98c146e66c0d57b4c36700d7b0ab6bcbe40f0
+Combined source tested: e8639151985cf59e5acbe209d9b1d4ebb1bbbb4b
+
+This integration branch combines independently based draft pull requests. It is
+an integration checkpoint, not a claim that the remaining feature-parity work is
+complete. The adjacent CSV lists the original contributions, status, regression
+contracts, and outstanding hardware acceptance for every retained capability.
+
+Draft contributions:
+#80 Per-handle RX gain bounds and X2 B1 scaling
+#81 Named RF component and tuning APIs
+#82 Channel labels and mapped handle metadata
+#83 Direct TX attenuation with existing gain compatibility
+#84 RX loss reporting and contiguous reads
+#85 Shared SDK lifetime and exclusive per-card ownership
+PR URLs: https://github.com/epiqsolutions/SoapySidekiq/pull/<number>
+
+Each PR passed GCC 11, Clang 14, GCC 11 ASan/UBSan, and formatting/static-analysis
+CI. The new portable SDK lifetime coordinator is included in static analysis.
+Normal/sanitizer case counts independently: #80 386; #81 387; #82 386;
+#83 386; #84 391; #85 394. All tooling cases ran without skips.
+
+Combined validation:
+415 cases passed normally with GCC 11.4 and 415 passed with ASan/UBSan, including
+LeakSanitizer. Changed-line formatting and whitespace checks passed.
+The full module built, linked, installed privately, and loaded with real
+Sidekiq SDK 4.26.0 on Ubuntu 26.04, GCC 15.2, SoapySDR 0.8.1.
+
+Focused combined Stretch M.2-2280 checks passed:
+- RX/TX named RF tuning at 100 MHz, aggregate readback and range comparison.
+- Card/type/channel metadata and RX A1 / TX A1 labels.
+- Maximum TX attenuation, legacy gain alias read/write, original attenuation restore.
+- Receive-only counter stream at 1 MS/s: deliberate 300 ms reader stall,
+  explicit overflow, and resumed timestamped reads.
+- Independent duplicate constructor rejection; active RX survived absent-card
+  and externally busy-card attempts; last close and two reopen cycles.
+
+No RF transmission was performed. These checks do not validate current GQRX,
+multi-channel RX, dual TX, X2 B1 hardware gain, two-card capture, GPSDO, or NV100
+profiles. Dragon's single Stretch cannot establish those card-specific behaviors.
+Multi-card lifetime is still draft pending a same-process two-card capture.
+The public portable tests do not replace SDK builds or physical acceptance.
+
+SDK 4.26 review found 50 added API declarations versus the installed 4.24 headers,
+without removed/changed existing API signatures in that comparison. Parameter
+structure definitions were unchanged. New topology/group APIs require runtime
+capability detection; the Stretch reports no topology support. No proprietary
+SDK headers or manuals are included in this checkpoint.
