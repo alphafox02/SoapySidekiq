@@ -498,6 +498,72 @@ size_t SoapySidekiq::getNumChannels(const int dir) const
 
 }
 
+SoapySDR::Kwargs SoapySidekiq::getChannelInfo(const int direction, const size_t channel) const
+{
+    validateChannel(direction, channel);
+    SoapySDR::Kwargs info;
+    info["card"] = std::to_string(card);
+    info["card_type"] = part_str;
+    info["sidekiq_channel"] = std::to_string(channel);
+
+    std::string name;
+    if (direction == SOAPY_SDR_RX)
+    {
+        const auto handle = getRxHandle(channel);
+        info["sidekiq_handle_id"] = std::to_string(handle);
+        switch (handle)
+        {
+        case skiq_rx_hdl_A1:
+            name = "A1";
+            break;
+        case skiq_rx_hdl_A2:
+            name = "A2";
+            break;
+        case skiq_rx_hdl_B1:
+            name = "B1";
+            break;
+        case skiq_rx_hdl_B2:
+            name = "B2";
+            break;
+        case skiq_rx_hdl_C1:
+            name = "C1";
+            break;
+        case skiq_rx_hdl_D1:
+            name = "D1";
+            break;
+        default:
+            name = std::to_string(handle);
+            break;
+        }
+    }
+    else
+    {
+        const auto handle = getTxHandle(channel);
+        info["sidekiq_handle_id"] = std::to_string(handle);
+        switch (handle)
+        {
+        case skiq_tx_hdl_A1:
+            name = "A1";
+            break;
+        case skiq_tx_hdl_A2:
+            name = "A2";
+            break;
+        case skiq_tx_hdl_B1:
+            name = "B1";
+            break;
+        case skiq_tx_hdl_B2:
+            name = "B2";
+            break;
+        default:
+            name = std::to_string(handle);
+            break;
+        }
+    }
+    info["sidekiq_handle"] = name;
+    info["label"] = std::string(direction == SOAPY_SDR_RX ? "RX " : "TX ") + name;
+    return info;
+}
+
 /*******************************************************************
  * Antenna API
  ******************************************************************/

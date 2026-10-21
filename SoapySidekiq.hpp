@@ -65,6 +65,12 @@ class SoapySidekiq : public SoapySDR::Device
      ******************************************************************/
 
     size_t getNumChannels(const int) const override;
+    // Older supported SoapySDR headers do not expose channel information.
+#ifdef SOAPY_SDR_API_HAS_GET_CHANNEL_INFO
+    SoapySDR::Kwargs getChannelInfo(int direction, size_t channel) const override;
+#else
+    SoapySDR::Kwargs getChannelInfo(int direction, size_t channel) const;
+#endif
 
     /*******************************************************************
      * Stream API

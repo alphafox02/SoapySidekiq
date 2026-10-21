@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -21,9 +22,26 @@
 #define SoapySDR_logf(...) ((void)0)
 using skiq_rx_hdl_t = unsigned;
 using skiq_tx_hdl_t = unsigned;
+enum : unsigned
+{
+    skiq_rx_hdl_A1,
+    skiq_rx_hdl_A2,
+    skiq_rx_hdl_B1,
+    skiq_rx_hdl_B2,
+    skiq_rx_hdl_C1,
+    skiq_rx_hdl_D1
+};
+enum : unsigned
+{
+    skiq_tx_hdl_A1,
+    skiq_tx_hdl_A2,
+    skiq_tx_hdl_B1,
+    skiq_tx_hdl_B2
+};
 
 namespace SoapySDR
 {
+using Kwargs = std::map<std::string, std::string>;
 struct ArgInfo
 {
     std::string key, name, description, units, value;
@@ -49,10 +67,13 @@ class SoapySidekiq
         std::array<HandleEntry, 3> tx_param{{{6}, {2}, {9}}};
     } param;
     std::uint8_t num_rx_channels{2}, num_tx_channels{3};
+    std::uint8_t card{5};
+    std::string part_str{"test-card"};
     double maxValue{2047}, txMaxValue{8191};
     std::uint32_t rx_payload_size_in_words{1020}, current_tx_block_size{252};
 
     std::size_t getNumChannels(int) const;
+    SoapySDR::Kwargs getChannelInfo(int, std::size_t) const;
     void validateChannel(int, std::size_t) const;
     skiq_rx_hdl_t getRxHandle(std::size_t) const;
     skiq_tx_hdl_t getTxHandle(std::size_t) const;
@@ -98,6 +119,40 @@ TEST_CASE("channel mapping rejects count boundaries and oversized indices")
     device.num_tx_channels = 0;
     REQUIRE_THROWS_AS(device.getRxHandle(0), std::out_of_range);
     REQUIRE_THROWS_AS(device.getTxHandle(0), std::out_of_range);
+}
+
+TEST_CASE("channel labels identify mapped SDK handles rather than logical channel numbers")
+{
+    SoapySidekiq device;
+    device.param.rx_param[0].handle = skiq_rx_hdl_B1;
+    device.param.rx_param[1].handle = skiq_rx_hdl_A1;
+    device.param.tx_param[0].handle = skiq_tx_hdl_A2;
+    REQUIRE_EQ(device.getChannelInfo(SOAPY_SDR_RX, 0).at("label"), std::string{"RX B1"});
+    REQUIRE_EQ(device.getChannelInfo(SOAPY_SDR_RX, 1).at("label"), std::string{"RX A1"});
+    REQUIRE_EQ(device.getChannelInfo(SOAPY_SDR_TX, 0).at("label"), std::string{"TX A2"});
+    const auto info = device.getChannelInfo(SOAPY_SDR_RX, 0);
+    REQUIRE_EQ(info.at("card"), std::string{"5"});
+    REQUIRE_EQ(info.at("card_type"), std::string{"test-card"});
+    REQUIRE_EQ(info.at("sidekiq_channel"), std::string{"0"});
+    REQUIRE_EQ(info.at("sidekiq_handle"), std::string{"B1"});
+    REQUIRE_EQ(info.at("sidekiq_handle_id"), std::to_string(skiq_rx_hdl_B1));
+}
+
+TEST_CASE("unknown SDK handle values retain a useful numeric channel label")
+{
+    SoapySidekiq device;
+    REQUIRE_EQ(device.getChannelInfo(SOAPY_SDR_RX, 1).at("label"), std::string{"RX 7"});
+    REQUIRE_EQ(device.getChannelInfo(SOAPY_SDR_TX, 2).at("sidekiq_handle_id"), std::string{"9"});
+}
+
+TEST_CASE("channel information rejects invalid directions and unavailable channels")
+{
+    SoapySidekiq device;
+    REQUIRE_THROWS_AS(device.getChannelInfo(9, 0), std::invalid_argument);
+    REQUIRE_THROWS_AS(device.getChannelInfo(SOAPY_SDR_RX, 2), std::out_of_range);
+    REQUIRE_THROWS_AS(device.getChannelInfo(SOAPY_SDR_TX, 3), std::out_of_range);
+    REQUIRE_THROWS_AS(device.getChannelInfo(SOAPY_SDR_RX, std::numeric_limits<std::size_t>::max()),
+                      std::out_of_range);
 }
 
 TEST_CASE("every exposed channel advertises both implemented stream formats")

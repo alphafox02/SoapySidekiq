@@ -334,10 +334,13 @@ extract_settings_method(channel_count "size_t SoapySidekiq::getNumChannels(" "\n
 string(APPEND channel_count "\n}\n")
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/ChannelValidationMethods.inc"
     "${channel_count}\n${channel_validation}")
+extract_settings_method(channel_information "SoapySDR::Kwargs SoapySidekiq::getChannelInfo("
+    "\n}\n")
+string(APPEND channel_information "\n}\n")
 extract_stream_method(stream_metadata "std::vector<std::string> SoapySidekiq::getStreamFormats("
     "void SoapySidekiq::stopTxWrites(")
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/ChannelMetadataMethods.inc"
-    "${channel_mapping}\n${stream_metadata}")
+    "${channel_mapping}\n${channel_information}\n${stream_metadata}")
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/ChannelMappingMethods.inc" "${channel_mapping}")
 extract_settings_method(frequency_methods "void SoapySidekiq::setFrequency("
     "void SoapySidekiq::setSampleRate(")
