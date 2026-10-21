@@ -1,0 +1,87 @@
+Multi-channel RX contribution checkpoint — 2026-10-21
+
+Source and scope
+Feature branch: feature/multi-channel-rx.
+Parent: integration/epiq-feature-parity at 493a7e76687302c744d0a13b18fc310a01b84a62.
+Production implementation a1d02d21fffc5ebca5bb1eab71e6ad194afe5a20;
+partial-stop ownership correction 3205480; hardware tool c4a046c9ae6e611f9d107b42aad1fcdd2893ba18.
+The reviewed hardware module was built from c4a046c. The next checkpoint
+adds this record and backend contract documentation without changing behavior.
+Upstream master remained 92660c9f7c5fd3840c6d68e983f53964468cf7f9 when rechecked.
+
+One RX stream can select multiple distinct, non-conflicting handles, with
+one card-level receive worker. All selected handles must share the same
+actual sample rate. Setup and activation both check rates. The SDK conflict
+query rejects invalid combinations before setup changes card configuration.
+Immediate starts use the RX-only synchronized multi-start API. Digital RF
+counters align a bounded set of per-handle pending blocks into shared planar
+queue entries, so partial reads and queue eviction advance every plane together.
+The system timestamp retains the first requested channel's original tick
+and exact crop/sample offset; alignment never uses rounded nanoseconds.
+
+Queue loss, hardware overrun, or a missing RF interval marks a shared gap.
+A caller receives the retained contiguous prefix, then SOAPY_SDR_OVERFLOW,
+then samples after the gap. Reversed buffer order is supported. All output
+pointers are validated before consuming samples. CS16 and CF32 use the same
+alignment path. An overlapping/backward RF counter fails the session because
+samples from distinct counter epochs cannot safely be paired.
+
+An SDK batch stop returning -ENODEV does not prove every selected handle
+stopped. The adapter queries remaining selected streaming handles on each
+multi-stop attempt and retains ownership on ambiguous or failed cleanup.
+Regression cases exercise partial release and retry without stopping unrelated
+handles. One RX stream token and one TX stream token per device remain the
+ownership model; TX remains single-channel.
+
+Software validation
+450 non-hardware cases passed with GCC 11, and 450 with ASan/UBSan.
+That includes 31 additional native/portable cases beyond the seven-PR parent:
+planar partial reads, shared overflow and invalid outputs; exact fractional
+system-time cropping; reordered arrivals, skew, missing blocks and bounded
+pending queues; worker filtering, teardown/retry and buffer order; production
+readStream CS16/CF32 and activation-rate checks; actual SDK control-method
+extraction with partial-stop failures and RX-only synchronized start checks.
+Changed C++ lines passed clang-format 14 checking. Clang/static-analysis CI
+has not been run on this feature branch. All four upstream CI jobs passed on
+each separate draft PR 80 through 86.
+
+Hardware validation
+NV100 revision F0; FPGA 3.21.0; SDK 4.26.0 g48d44c790; DMA 5.4.12.0;
+Ubuntu 24.04.4 / DragonOS Noble, kernel 6.17.0-22-generic, x86_64.
+Full SDK module build, isolated installation, and plugin load passed.
+The installed SDK symlink still selects 4.25.0; loaded modules and /usr/lib/epiq
+were retained. Tests used a privately staged SDK 4.26 and module prefix.
+
+The checked-in tests/hardware/nv100_multichannel_rx.cpp passed 16 cases:
+A1/A2 and A1/B1, both requested buffer orders, CS16 and CF32, RF and system
+timestamps. Rate was 5 MS/s, bandwidth 4 MHz, receive LO 1.8 GHz; no TX stream
+was configured or started. Each case checked at least 65,792 complex samples
+per plane before a deliberate 100 ms reader stall, then shared overflow,
+recovery with a stable relative counter offset, and same-stream reactivation.
+No initial overflow was observed. RF partial-read time was exact at 200 ns per
+sample. System-time continuity across hardware blocks allowed one system
+clock tick plus 1 ns. Digital counter offsets may differ between channels;
+the check requires a constant relative offset within each activation.
+Conflicting A2/B1 in either order, all three handles, duplicate channels, and
+an out-of-range channel were rejected. The final reviewed module passed all
+16 cases after the partial-stop correction.
+
+The earlier a1d02d2 production checkpoint additionally passed all six
+single-channel A1/A2/B1 CS16/CF32 counter, timestamp, stall and recovery cases.
+The subsequent correction changes only the multi-handle stop path.
+The card was released after testing; counter source and timestamp-source
+settings were restored. Rate, bandwidth, and RX LO remain at test values.
+
+Limits and upstream submission
+This is bounded digital receive-path validation. It does not establish analog
+RF phase coherence, long-run performance, PPS behavior, multi-card physical
+operation, or TX correctness. Only NV100 multi-channel behavior has hardware
+acceptance here. Unsupported synchronized-start products fail explicitly.
+The known NV100 explicit-topology-apply ENOTSUP observation remains recorded
+in docs/nv100-validation.txt; the tested path uses legacy RX-only APIs.
+
+This larger feature is preserved on the fork for review and later extraction.
+It builds on the tested seven-PR integration checkpoint; it is not an eighth
+upstream PR containing those unrelated changes. Keep upstream contributions
+focused and rebase the RX feature after its RX-loss dependency lands.
+The remaining feature-parity CSV rows are still outstanding work.

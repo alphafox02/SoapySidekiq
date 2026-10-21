@@ -73,7 +73,11 @@ class RxStreamBackend
         return handles.size() == 1 ? start(handles.front(), on_pps) : -ENOTSUP;
     }
 
-    /** Stop every handle owned by this session, retaining ownership on failure. */
+    /**
+     * Stop selected handles, including retries after a partially successful stop.
+     * Zero or -ENODEV must mean every selected handle is inactive. Any other
+     * result retains ownership of the full selection for a later retry.
+     */
     virtual int stopMulti(const std::vector<std::uint32_t> &handles, bool on_pps)
     {
         return handles.size() == 1 ? stop(handles.front(), on_pps) : -ENOTSUP;
