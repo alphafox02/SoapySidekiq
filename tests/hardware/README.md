@@ -49,6 +49,9 @@ Current programs:
   immediate cleanup after timed activation, and stream reuse. Its first timed
   TX write retries per-call timeouts for up to five seconds while PPS startup
   is pending.
+- `nv100_multichannel_rx.cpp` checks NV100 two-channel CS16/CF32 counter data,
+  RF/system timestamps, buffer order, loss recovery, and reactivation. It runs
+  both A1/A2 and A1/B1 pairs, and rejects A2/B1. It never starts a TX stream.
 - `test_api.py` interactively exercises device-control APIs.
 
 The full-duplex detector searches actual spectral peaks within the larger of
@@ -64,7 +67,11 @@ quantization-spur failure and a weaker real peer alongside local leakage.
 ## Known integration limits
 
 The driver currently supports one RX stream and one TX stream per device,
-with one channel in each stream. An advertised handle does not establish that
+with one TX channel. RX accepts multiple non-conflicting handles at the same
+actual sample rate and returns equal sample counts in requested buffer order.
+Immediate multi-channel activation requires the SDK's synchronized RX start;
+unsupported products fail that operation rather than falling back to an
+unsynchronized start. An advertised handle does not establish that
 every RX/TX handle pair can operate together. Confirm the SDK topology and RF
 port mapping for the chosen pair.
 
@@ -103,3 +110,30 @@ needed. `cs16_validate.py` checks both RF and system sample timestamps.
 
 The bounded timestamp, simultaneous RX/TX, and RX retuning examples are in
 [`examples/python`](../../examples/python/).
+
+## NV100 multi-channel RX counter check
+
+Build this standalone program against SoapySDR and select the module being
+validated through the usual plugin environment:
+
+```bash
+c++ -std=c++17 -O2 tests/hardware/nv100_multichannel_rx.cpp \
+  $(pkg-config --cflags --libs SoapySDR) -o /tmp/nv100_multichannel_rx
+SOAPY_SDR_ROOT="$PWD/build/dev-install" \
+SOAPY_SDR_PLUGIN_PATH="$PWD/build/dev-install/lib/SoapySDR/modules0.8" \
+  timeout 240 /tmp/nv100_multichannel_rx driver=sidekiq,card=0
+```
+
+Use a released NV100 with three exposed RX handles. The program configures
+5 MS/s, 4 MHz bandwidth and a 1.8 GHz receive LO, and restores the counter and
+timestamp-source settings on normal or exception exits. Rate, bandwidth and
+receive tuning remain at the test values. SDK profile calibration can take
+several seconds. Run this program alone on the selected card.
+
+Each of 16 cases verifies at least 65,792 complex samples per channel before
+a 100 ms reader stall, checks shared overflow and aligned recovery, then
+reactivates the same stream. RF timestamps are checked exactly; system-time
+continuity allows one system-clock tick plus one nanosecond across hardware
+block boundaries. The relative digital counter offset must remain constant
+between the two planes, including across overflow recovery. Counter alignment
+does not establish analog RF phase coherence. PPS and TX are separate checks.
