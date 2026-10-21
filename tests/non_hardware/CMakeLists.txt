@@ -550,6 +550,24 @@ target_link_libraries(rx_block_aligner_tests PRIVATE non_hardware_test_options)
 add_test(NAME rx-block-aligner.all COMMAND rx_block_aligner_tests)
 set_tests_properties(rx-block-aligner.all PROPERTIES LABELS "unit;non-hardware")
 
+# Exercise the production SDK control adapter with a small fake C boundary.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ../../SidekiqRxBackend.cpp)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/../../SidekiqRxBackend.cpp" backend_source)
+string(FIND "${backend_source}" "SidekiqRxBackend::SidekiqRxBackend(" backend_start)
+string(FIND "${backend_source}" "RxReceiveResult SidekiqRxBackend::receive()" backend_end)
+if(backend_start LESS 0 OR backend_end LESS backend_start)
+    message(FATAL_ERROR "Could not locate production RX SDK control methods")
+endif()
+math(EXPR backend_length "${backend_end} - ${backend_start}")
+string(SUBSTRING "${backend_source}" ${backend_start} ${backend_length} backend_methods)
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/RxBackendControlMethods.inc" "${backend_methods}")
+add_executable(rx_backend_control_tests support/TestMain.cpp component/RxBackendControlTests.cpp)
+target_include_directories(rx_backend_control_tests PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/support" "${CMAKE_CURRENT_BINARY_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../../include")
+target_link_libraries(rx_backend_control_tests PRIVATE non_hardware_test_options)
+add_test(NAME rx-backend-control.all COMMAND rx_backend_control_tests)
+set_tests_properties(rx-backend-control.all PROPERTIES LABELS "component;non-hardware")
+
 add_custom_target(non_hardware_tests
     COMMAND "${CMAKE_CTEST_COMMAND}" --output-on-failure
     DEPENDS discovery_tests device_option_tests sensor_tests sdk_logging_tests
@@ -558,5 +576,5 @@ add_custom_target(non_hardware_tests
             time_readback_tests time_setting_tests pps_source_tests clock_tests settings_tests
             tx_callback_initialization_tests stream_configuration_tests
             stream_conversion_tests rx_sample_queue_tests rx_sample_queue_portable_tests
-            rx_stream_session_tests rx_block_aligner_tests tx_write_tests timestamp_portable_tests rx_lifecycle_tests
+            rx_stream_session_tests rx_block_aligner_tests rx_backend_control_tests tx_write_tests timestamp_portable_tests rx_lifecycle_tests
     USES_TERMINAL)

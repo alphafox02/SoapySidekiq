@@ -8,6 +8,8 @@
 #include <sidekiq_api.h>
 
 #include <cerrno>
+#include <array>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <utility>
@@ -63,16 +65,36 @@ int SidekiqRxBackend::stopMulti(const std::vector<std::uint32_t> &handles, const
         return -EINVAL;
     if (handles.size() == 1)
         return stop(handles.front(), on_pps);
+    // A previous failed batch stop may have stopped only some handles. Query
+    // remaining ownership before retrying; SDK -ENODEV from a batch means at
+    // least one handle is inactive, not necessarily that every handle stopped.
+    std::array<skiq_rx_hdl_t, skiq_rx_hdl_end> streaming{};
+    std::uint8_t count{};
+    const int read_status = skiq_read_rx_streaming_handles(card_, streaming.data(), &count);
+    if (read_status != 0)
+        return read_status;
+    if (count > streaming.size())
+        return -EIO;
     std::vector<skiq_rx_hdl_t> native;
     native.reserve(handles.size());
     for (const auto handle : handles)
-        native.push_back(static_cast<skiq_rx_hdl_t>(handle));
-    return on_pps
-               ? skiq_stop_rx_streaming_multi_on_trigger(card_, native.data(),
-                                                         static_cast<std::uint8_t>(native.size()),
-                                                         skiq_trigger_src_1pps, 0)
-               : skiq_stop_rx_streaming_multi_immediate(card_, native.data(),
-                                                        static_cast<std::uint8_t>(native.size()));
+    {
+        const auto selected = static_cast<skiq_rx_hdl_t>(handle);
+        if (std::find(streaming.begin(), streaming.begin() + count, selected) !=
+            streaming.begin() + count)
+            native.push_back(selected);
+    }
+    if (native.empty())
+        return 0;
+    const int status =
+        native.size() == 1 ? stop(static_cast<std::uint32_t>(native.front()), on_pps)
+        : on_pps           ? skiq_stop_rx_streaming_multi_on_trigger(card_, native.data(),
+                                                                     static_cast<std::uint8_t>(native.size()),
+                                                                     skiq_trigger_src_1pps, 0)
+                           : skiq_stop_rx_streaming_multi_immediate(card_, native.data(),
+                                                                    static_cast<std::uint8_t>(native.size()));
+    // A race with hardware state must preserve session ownership for retry.
+    return status == -ENODEV ? -EIO : status;
 }
 
 RxReceiveResult SidekiqRxBackend::receive()
