@@ -167,6 +167,12 @@ are preserved and can also run automatically in that mode. Disabling DC-offset
 correction clears only its selection bit and preserves the shared mode.
 The SDK can run selected calibrations during subsequent RX tuning operations.
 
+`listSampleRates()` suggests documented equal-rate built-in profiles for NV100
+and NVM2, filtered by the SDK's card and selected-channel bounds. A continuous
+hardware range does not imply that every intermediate value is a supported
+profile. Disparate RX/TX rates and custom profiles require their own configuration;
+the suggestion list does not enumerate those combinations.
+
 Automatic gain control is exposed for RX. TX uses manual attenuation and
 reports `hasGainMode()` as false; requesting TX automatic mode raises an error.
 

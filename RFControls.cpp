@@ -774,7 +774,8 @@ void SoapySidekiq::setBandwidth(const int direction, const size_t channel, const
  * sample rates.  For AD9361 cards, these have contiguous sample rates
  * available.
  * For other cards, there are profiles and there are only specific rates available
- * For now we will just give a list of min-max, with steps of 250k Hz.
+ * NV100/NVM2 use documented built-in profiles; the existing 250 kHz
+ * compatibility grid remains for the other cards.
  */
 std::vector<double> SoapySidekiq::listSampleRates(const int direction, const size_t channel) const
 {
@@ -782,6 +783,33 @@ std::vector<double> SoapySidekiq::listSampleRates(const int direction, const siz
     const auto minimum = static_cast<uint64_t>(bounds.minimum());
     const auto maximum = static_cast<uint64_t>(bounds.maximum());
     std::vector<double> rates;
+    if (part == skiq_nv100 || part == skiq_nvm2)
+    {
+        // Built-in equal-rate profiles from the SDK 4.26 development manual,
+        // section 5.8.5. Disparate-rate and custom profiles have other constraints
+        // and are not suggestions for an ordinary single-direction rate change.
+        static constexpr uint32_t profiles[]{
+            160000,   250000,   270270,   307200,   541667,   625000,   640000,
+            740740,   750000,   1000000,  1920000,  2457600,  2500000,  2800000,
+            3840000,  4000000,  4915200,  5000000,  5600000,  7680000,  9830400,
+            10000000, 11200000, 15360000, 16000000, 20000000, 21666700, 22000000,
+            23040000, 30720000, 40000000, 50000000, 60000000, 61440000};
+        const auto handle_minimum = direction == SOAPY_SDR_RX
+                                        ? param.rx_param[channel].sample_rate_min
+                                        : param.tx_param[channel].sample_rate_min;
+        const auto handle_maximum = direction == SOAPY_SDR_RX
+                                        ? param.rx_param[channel].sample_rate_max
+                                        : param.tx_param[channel].sample_rate_max;
+        if (handle_minimum == 0 || handle_maximum == 0 || handle_minimum > handle_maximum)
+            throw std::runtime_error("invalid per-channel SDK sample-rate bounds (card " +
+                                     std::to_string(card) + ", channel " + std::to_string(channel) +
+                                     ")");
+        for (const auto rate : profiles)
+            if (rate >= minimum && rate <= maximum && rate >= handle_minimum &&
+                rate <= handle_maximum)
+                rates.push_back(rate);
+        return rates;
+    }
     // Keep the legacy compatibility grid. A wider counter prevents uint32
     // wraparound at a large SDK maximum; this does not enumerate RF profiles.
     for (uint64_t rate = minimum; rate <= maximum; rate += 250000)
