@@ -312,3 +312,7 @@ operation. This synchronizes digital timestamps; it does not promise analog
 RF phase coherence. TX remains single-channel. See the
 [hardware test instructions](tests/hardware/README.md) for the bounded NV100
 counter check and its tested scope.
+
+The [NV100 TX/RX smoke record](docs/nv100-tx-validation.txt) documents a separate
+finite CS16/CF32 tone check at maximum reported attenuation, including its
+TX-off controls and same-card RF measurement limits.

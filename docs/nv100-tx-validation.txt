@@ -1,0 +1,81 @@
+NV100 bounded TX/RX smoke check — 2026-10-21
+
+Result
+Four finite same-card tone observations passed: CS16 and CF32 TX, each at
+approximately +200 kHz and +400 kHz relative to a 915 MHz center frequency.
+The strongest received spectral peak followed both requested offsets, rose
+34.94–39.01 dB above a TX-off capture in the expected frequency region, and
+was 37.06–38.98 dB above the capture's median spectral power. Peak sample
+magnitude stayed below 1% of CS16 full scale; no clipping was observed.
+Detailed measurements are in docs/nv100-tx-results.csv.
+
+Setup and identity
+NV100 revision F0, FPGA 3.21.0, SDK 4.26.0 g48d44c790, DMA 5.4.12.0.
+Ubuntu 24.04.4 / DragonOS Noble; kernel 6.17.0-22-generic; SoapySDR 0.8.
+Driver production source c4a046c9ae6e611f9d107b42aad1fcdd2893ba18, preserved
+at integration checkpoint 2ed9990512fa15b78248cdaa2e70023677f0fb2f; the latter
+adds validation and backend-contract documentation without behavior changes.
+The isolated module SHA256 was
+811345b4450df6c6f77a3360342f363a1b488c12dfd739d89076fc5c8435009f.
+This is combined-integration evidence, not a standalone build of PR 83.
+
+The selected logical channels were TX 0 (A1) and RX 2 (B1). Live SDK-backed
+antenna readback reported TX skiq_rf_port_J1 and RX skiq_rf_port_J2. The card
+had two antennas attached; their antenna bands and coupling were unmeasured.
+The test used 5 MS/s and 4 MHz bandwidth, manual RX gain 34 dB, maximum
+SDK-advertised TX attenuation 41.75 dB, and waveform amplitude 0.02 of host
+full scale. Named attenuation readback confirmed the requested 41.75 dB.
+No external attenuator, calibrated receiver, or power meter was used.
+Absolute RF output power was not measured or inferred from these controls.
+
+The public NV100 hardware manual supports A1 TX and B1 RX on different RF
+ports. Its nominal TX gain-control range is 48 dB, but the live SDK reports
+41.75 dB maximum for this card. An initial harness guard expecting at least
+48 dB stopped before any TX stream was activated. The corrected run used
+actual SDK bounds, readback, and further-reduced waveform amplitude. This
+was a harness assumption, not an observed driver failure.
+Reference: Epiq Sidekiq NV100 Hardware User Manual v1.4, pages 14, 17 and 20:
+https://resources.epiqsolutions.com/hubfs/Epiq-Solutions-Sidekiq-Nv100-Hardware-User-Manual.pdf?hsLang=en
+
+Method and scope
+The harness checked logical handle and physical-port mappings, configured
+profiles before tuning, disabled the internal counter data source, verified
+maximum named attenuation, and captured a TX-off baseline for each format.
+It then submitted whole 16,380-sample MTUs with a bounded 0.20-second loop
+for each tone. Immediate TX deactivation followed the loop; accepted sample
+counts describe host submission, not a measurement of radiated duration or
+samples. Each on-capture contains 262,144 complex CS16 RX samples; each
+baseline contains 131,072. A full-period tone buffer avoids restart artifacts.
+Actual requested offsets were 199938.949939 and 399877.899878 Hz.
+
+Three later capture windows were analyzed with 16,384-point Hann FFTs. Their
+median power spectrum supplied the strongest peak, expected-band power and
+median noise reference. Frequency tolerance was two FFT bins, 610.35 Hz.
+Pass criteria required the strongest peak at the expected tone, at least
+10 dB over median power, at least 6 dB above TX-off expected-band power, and
+less than 80% full-scale peak magnitude. Synthetic detector checks accepted
+the expected tone and rejected a different tone and noise-only input.
+
+Each +400 kHz capture reported one RX overflow after analysis paused the
+consumer between tone runs; both recovered and supplied the complete requested
+capture. No counter continuity or gap-free streaming claim is made for this
+FFT check. The separate digital RX validation covers gap reporting and aligned
+recovery with the internal counter source.
+
+Both formats transmitted host data and produced the expected same-card RF
+observations. This does not distinguish antenna coupling from internal leakage,
+measure antenna efficiency or port isolation, establish RF output power or
+spectral compliance, or validate dual-channel, timed, non-MTU, or long-running
+TX. It is a short smoke check of the existing immediate single-channel TX/RX
+path and named attenuation control on one NV100.
+
+Cleanup and evidence
+TX and RX streams were stopped and closed, original attenuation, RX gain,
+gain mode and counter settings were restored, and the card reported available.
+Rate, bandwidth and tuning remain at the test values. The installed SDK symlink
+still selects 4.25.0; /usr/lib/epiq and loaded kernel modules were unchanged.
+The 4.26 SDK and tested driver used private staging and installation prefixes.
+Raw captures, harness, output and the corrected/initial results are retained
+privately in the audit workspace; no raw RF captures are added to the repo.
+Evidence archive SHA256:
+0d6b98a33b952d0ede9936428095b673d5a89cb4db252203dcde63009acfe146.
