@@ -164,6 +164,13 @@ class SoapySidekiq : public SoapySDR::Device
 
     SoapySDR::RangeList getFrequencyRange(const int direction, const size_t channel) const override;
 
+    std::vector<std::string> listFrequencies(int direction, size_t channel) const override;
+    void setFrequency(int direction, size_t channel, const std::string &name, double frequency,
+                      const SoapySDR::Kwargs &args = SoapySDR::Kwargs()) override;
+    double getFrequency(int direction, size_t channel, const std::string &name) const override;
+    SoapySDR::RangeList getFrequencyRange(int direction, size_t channel,
+                                          const std::string &name) const override;
+
     /*******************************************************************
      * Sample Rate API
      ******************************************************************/
@@ -255,6 +262,8 @@ class SoapySidekiq : public SoapySDR::Device
     void validateChannel(int direction, size_t channel) const;
     /** Require a named gain element advertised for the selected channel. */
     void validateGainName(int direction, size_t channel, const std::string &name) const;
+    /** Validate the sole RF tuning element before forwarding to aggregate APIs. */
+    void validateFrequencyName(int direction, size_t channel, const std::string &name) const;
     /** Read the configured RF port; empty when reporting is unavailable. */
     std::string currentAntenna(int direction, size_t channel) const;
     /** RX index bounds and handle-specific conversion from the SDK gain table. */

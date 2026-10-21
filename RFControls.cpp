@@ -5,6 +5,7 @@
 
 #include "SoapySidekiq.hpp"
 #include <SoapySidekiq/NumericConversion.hpp>
+#include <SoapySidekiq/StringUtils.hpp>
 #include <algorithm>
 #include <cerrno>
 #include <cmath>
@@ -576,6 +577,43 @@ SoapySDR::RangeList SoapySidekiq::getFrequencyRange(const int direction, const s
     }
 
     return results;
+}
+
+std::vector<std::string> SoapySidekiq::listFrequencies(const int direction,
+                                                       const size_t channel) const
+{
+    validateChannel(direction, channel);
+    return {"RF"};
+}
+
+void SoapySidekiq::validateFrequencyName(const int direction, const size_t channel,
+                                         const std::string &name) const
+{
+    validateChannel(direction, channel);
+    if (!equalsIgnoreCase(name, "RF"))
+        throw std::invalid_argument("unknown frequency element '" + name +
+                                    "'; Sidekiq exposes only RF tuning");
+}
+
+void SoapySidekiq::setFrequency(const int direction, const size_t channel, const std::string &name,
+                                const double frequency, const SoapySDR::Kwargs &args)
+{
+    validateFrequencyName(direction, channel, name);
+    setFrequency(direction, channel, frequency, args);
+}
+
+double SoapySidekiq::getFrequency(const int direction, const size_t channel,
+                                  const std::string &name) const
+{
+    validateFrequencyName(direction, channel, name);
+    return getFrequency(direction, channel);
+}
+
+SoapySDR::RangeList SoapySidekiq::getFrequencyRange(const int direction, const size_t channel,
+                                                    const std::string &name) const
+{
+    validateFrequencyName(direction, channel, name);
+    return getFrequencyRange(direction, channel);
 }
 
 /*******************************************************************

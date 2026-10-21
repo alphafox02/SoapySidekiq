@@ -6,6 +6,8 @@
 #include "TestHarness.hpp"
 #include <SoapySidekiq/NumericConversion.hpp>
 #include <array>
+#include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cstdint>
 #include <map>
@@ -132,6 +134,11 @@ class SoapySidekiq
     void setFrequency(int, std::size_t, double, const SoapySDR::Kwargs &);
     double getFrequency(int, std::size_t) const;
     SoapySDR::RangeList getFrequencyRange(int, std::size_t) const;
+    std::vector<std::string> listFrequencies(int, std::size_t) const;
+    void validateFrequencyName(int, std::size_t, const std::string &) const;
+    void setFrequency(int, std::size_t, const std::string &, double, const SoapySDR::Kwargs &);
+    double getFrequency(int, std::size_t, const std::string &) const;
+    SoapySDR::RangeList getFrequencyRange(int, std::size_t, const std::string &) const;
 };
 #include "ChannelValidationMethods.inc"
 #include "ChannelMappingMethods.inc"
@@ -148,6 +155,64 @@ TEST_CASE("RX and TX tuning use the mapped handle and preserve fractional-unit t
         REQUIRE_EQ(sdk.card, device.card);
         REQUIRE_EQ(sdk.direction, direction);
     }
+}
+
+TEST_CASE("every available RX and TX channel advertises the RF tuning component")
+{
+    SoapySidekiq device;
+    const std::vector<std::string> expected{"RF"};
+    for (const int direction : {SOAPY_SDR_RX, SOAPY_SDR_TX})
+        for (std::size_t channel = 0; channel < device.getNumChannels(direction); ++channel)
+            REQUIRE(device.listFrequencies(direction, channel) == expected);
+    REQUIRE_EQ(sdk.calls, 0u);
+}
+
+TEST_CASE("named RF tuning preserves aggregate conversion readback and mapped handles")
+{
+    SoapySidekiq device;
+    for (const int direction : {SOAPY_SDR_RX, SOAPY_SDR_TX})
+        for (const std::string name : {"RF", "rf", "Rf", "rF"})
+        {
+            device.setFrequency(direction, 1, name, 915000000.75, {});
+            REQUIRE_EQ(sdk.written, std::uint64_t{915000000});
+            REQUIRE_EQ(sdk.handle, direction == SOAPY_SDR_RX ? 7u : 2u);
+            REQUIRE_EQ(device.getFrequency(direction, 1, name), sdk.actual);
+            const auto ranges = device.getFrequencyRange(direction, 1, name);
+            REQUIRE_EQ(ranges.size(), std::size_t{1});
+            REQUIRE_EQ(ranges[0].minimum, static_cast<double>(sdk.minimum));
+            REQUIRE_EQ(ranges[0].maximum, static_cast<double>(sdk.maximum));
+        }
+}
+
+TEST_CASE("unknown tuning components cannot silently tune the aggregate RF frequency")
+{
+    SoapySidekiq device;
+    for (const int direction : {SOAPY_SDR_RX, SOAPY_SDR_TX})
+        for (const std::string name : {"", "BB", "RF2", "unknown"})
+        {
+            REQUIRE_THROWS_AS(device.setFrequency(direction, 0, name, 915000000, {}),
+                              std::invalid_argument);
+            REQUIRE_THROWS_AS(device.getFrequency(direction, 0, name), std::invalid_argument);
+            REQUIRE_THROWS_AS(device.getFrequencyRange(direction, 0, name), std::invalid_argument);
+        }
+    REQUIRE_EQ(sdk.calls, 0u);
+}
+
+TEST_CASE("RF component APIs validate directions and channels before SDK access")
+{
+    SoapySidekiq device;
+    REQUIRE_THROWS_AS(device.listFrequencies(9, 0), std::invalid_argument);
+    REQUIRE_THROWS_AS(device.setFrequency(9, 0, "RF", 1, {}), std::invalid_argument);
+    REQUIRE_THROWS_AS(device.getFrequency(9, 0, "RF"), std::invalid_argument);
+    REQUIRE_THROWS_AS(device.getFrequencyRange(9, 0, "RF"), std::invalid_argument);
+    for (const int direction : {SOAPY_SDR_RX, SOAPY_SDR_TX})
+    {
+        REQUIRE_THROWS_AS(device.listFrequencies(direction, 2), std::out_of_range);
+        REQUIRE_THROWS_AS(device.setFrequency(direction, 2, "RF", 1, {}), std::out_of_range);
+        REQUIRE_THROWS_AS(device.getFrequency(direction, 2, "RF"), std::out_of_range);
+        REQUIRE_THROWS_AS(device.getFrequencyRange(direction, 2, "RF"), std::out_of_range);
+    }
+    REQUIRE_EQ(sdk.calls, 0u);
 }
 TEST_CASE("invalid RF frequencies fail before any SDK call")
 {

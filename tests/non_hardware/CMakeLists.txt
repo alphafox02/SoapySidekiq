@@ -341,7 +341,10 @@ file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/ChannelMetadataMethods.inc"
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/ChannelMappingMethods.inc" "${channel_mapping}")
 extract_settings_method(frequency_methods "void SoapySidekiq::setFrequency("
     "void SoapySidekiq::setSampleRate(")
-file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/FrequencyMethods.inc" "${frequency_methods}")
+extract_settings_method(frequency_case_fold "bool equalsIgnoreCase(" "\n}\n")
+string(APPEND frequency_case_fold "\n}\n")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/FrequencyMethods.inc"
+    "${frequency_case_fold}\n${frequency_methods}")
 add_executable(frequency_tests support/TestMain.cpp component/FrequencyTests.cpp)
 target_include_directories(frequency_tests PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/support" "${CMAKE_CURRENT_BINARY_DIR}"
