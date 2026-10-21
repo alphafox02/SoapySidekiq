@@ -290,3 +290,25 @@ an argument error.
 ## License
 
 - https://github.com/pothosware/SoapySidekiq/blob/master/LICENSE
+
+## Multi-channel receive streams
+
+A device owns one RX stream and one TX stream. An RX stream can select multiple
+non-conflicting channels with equal actual sample rates, for example
+`setupStream(SOAPY_SDR_RX, "CS16", {0, 2})` on an NV100 exposing A1/A2/B1.
+Pass one output buffer for each selected channel in that same order. The return
+count is the number of complex samples in each buffer. CS16 and CF32 use the
+same channel alignment and timestamp path.
+
+The card has one receive worker. It aligns selected handles by their RF sample
+counters before publishing a shared queue entry, retaining exact timestamp
+phase for partial reads. A missing block or slow reader reports
+`SOAPY_SDR_OVERFLOW` before subsequent aligned samples. Conflicting selections
+such as NV100 A2/B1 are rejected before stream setup changes hardware. Actual
+sample rates are checked again at activation.
+
+Multi-channel immediate start requires the SDK's synchronized RX-only start
+operation. This synchronizes digital timestamps; it does not promise analog
+RF phase coherence. TX remains single-channel. See the
+[hardware test instructions](tests/hardware/README.md) for the bounded NV100
+counter check and its tested scope.

@@ -339,3 +339,88 @@ TEST_CASE("fractional samples advance a nanosecond-based queue timestamp")
     REQUIRE_EQ(queue.read(output, 1, std::chrono::microseconds(0)).time_ns,
                std::int64_t{666666673});
 }
+
+TEST_CASE("planar RX reads advance every channel together across partial blocks")
+{
+    RxSampleQueue queue(3, 2);
+    queue.start();
+    queue.pushChannelsTicks({{1, 2, 3, 4}, {11, 12, 13, 14}}, 10, 1000000, 1000000);
+    queue.pushChannelsTicks({{5, 6, 7, 8}, {15, 16, 17, 18}}, 12, 1000000, 1000000);
+    std::int16_t a[6]{}, b[6]{};
+    std::int16_t *outputs[]{a, b};
+    REQUIRE_EQ(queue.readChannels(outputs, 1, 0us).time_ns, std::int64_t{10000});
+    const auto result = queue.readChannels(outputs, 3, 0us);
+    REQUIRE_EQ(result.samples, std::size_t{3});
+    REQUIRE_EQ(result.time_ns, std::int64_t{11000});
+    REQUIRE((std::vector<std::int16_t>(a, a + 6) == std::vector<std::int16_t>{3, 4, 5, 6, 7, 8}));
+    REQUIRE(
+        (std::vector<std::int16_t>(b, b + 6) == std::vector<std::int16_t>{13, 14, 15, 16, 17, 18}));
+}
+
+TEST_CASE("planar RX eviction reports one shared gap before paired retained samples")
+{
+    RxSampleQueue queue(1, 2);
+    queue.start();
+    queue.pushChannelsTicks({{1, 2, 3, 4}, {11, 12, 13, 14}}, 0, 1, 1);
+    std::int16_t a[4]{}, b[4]{};
+    std::int16_t *outputs[]{a, b};
+    REQUIRE_EQ(queue.readChannels(outputs, 1, 0us).samples, std::size_t{1});
+    REQUIRE(queue.pushChannelsTicks({{5, 6}, {15, 16}}, 2, 1, 1) == RxPushStatus::dropped_oldest);
+    REQUIRE(queue.readChannels(nullptr, 0, 0us).status == RxReadStatus::samples);
+    REQUIRE(queue.readChannels(outputs, 1, 0us).status == RxReadStatus::overflow);
+    REQUIRE_EQ(a[0], std::int16_t{1});
+    REQUIRE_EQ(b[0], std::int16_t{11});
+    REQUIRE_EQ(queue.readChannels(outputs, 1, 0us).samples, std::size_t{1});
+    REQUIRE_EQ(a[0], std::int16_t{5});
+    REQUIRE_EQ(b[0], std::int16_t{15});
+    REQUIRE(queue.readChannels(outputs, 1, 0us).status == RxReadStatus::timeout);
+}
+
+TEST_CASE("planar RX validates all planes and buffers before consuming samples")
+{
+    REQUIRE_THROWS_AS(RxSampleQueue(1, 0), std::invalid_argument);
+    RxSampleQueue queue(1, 2);
+    queue.start();
+    REQUIRE_THROWS_AS(queue.pushChannelsTicks({{1, 2}}, 0, 1, 1), std::invalid_argument);
+    REQUIRE_THROWS_AS(queue.pushChannelsTicks({{}, {}}, 0, 1, 1), std::invalid_argument);
+    REQUIRE_THROWS_AS(queue.pushChannelsTicks({{1}, {2}}, 0, 1, 1), std::invalid_argument);
+    REQUIRE_THROWS_AS(queue.pushChannelsTicks({{1, 2}, {3, 4, 5, 6}}, 0, 1, 1),
+                      std::invalid_argument);
+    queue.pushChannelsTicks({{1, 2}, {11, 12}}, 0, 1, 1);
+    std::int16_t a[2]{}, b[2]{};
+    std::int16_t *invalid[]{a, nullptr};
+    REQUIRE_THROWS_AS(queue.readChannels(invalid, 1, 0us), std::invalid_argument);
+    REQUIRE_EQ(a[0], std::int16_t{0});
+    REQUIRE_THROWS_AS(queue.read(a, 1, 0us), std::logic_error);
+    std::int16_t *valid[]{a, b};
+    REQUIRE_EQ(queue.readChannels(valid, 1, 0us).samples, std::size_t{1});
+    REQUIRE_EQ(b[0], std::int16_t{11});
+}
+
+TEST_CASE("aligned planar RX retains original fractional system phase and sample offset")
+{
+    RxSampleQueue queue(1, 2);
+    queue.start();
+    queue.pushChannelsTicks({{1, 2, 3, 4}, {11, 12, 13, 14}}, 3, 7,
+                            soapy_sidekiq::TimestampRate::fromActualRate(7.5), 1);
+    std::int16_t a[2]{}, b[2]{};
+    std::int16_t *outputs[]{a, b};
+    REQUIRE_EQ(queue.readChannels(outputs, 1, 0us).time_ns, std::int64_t{561904761});
+    REQUIRE_EQ(queue.readChannels(outputs, 1, 0us).time_ns, std::int64_t{695238095});
+}
+
+TEST_CASE("stopping a planar RX queue wakes a blocked reader")
+{
+    RxSampleQueue queue(1, 2);
+    queue.start();
+    auto reader = std::async(std::launch::async,
+                             [&]
+                             {
+                                 std::int16_t a[2]{}, b[2]{};
+                                 std::int16_t *outputs[]{a, b};
+                                 return queue.readChannels(outputs, 1, 5s).status;
+                             });
+    queue.stop();
+    REQUIRE(reader.wait_for(1s) == std::future_status::ready);
+    REQUIRE(reader.get() == RxReadStatus::stopped);
+}

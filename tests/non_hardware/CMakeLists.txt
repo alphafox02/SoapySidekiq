@@ -162,7 +162,7 @@ add_executable(rx_stream_session_tests
     support/TestMain.cpp
     component/RxStreamSessionTests.cpp
     ../../RxSampleQueue.cpp
-    ../../RxStreamSession.cpp)
+    ../../RxStreamSession.cpp ../../RxBlockAligner.cpp)
 target_include_directories(rx_stream_session_tests PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/support"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../include")
@@ -523,7 +523,7 @@ string(SUBSTRING "${activate_method}" 0 ${tx_branch} rx_activate)
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/RxLifecycleMethods.inc"
     "${rx_close}\n${rx_deactivate}\n${rx_activate}\n    return 0;\n}\n")
 add_executable(rx_lifecycle_tests
-    support/TestMain.cpp component/RxLifecycleTests.cpp ../../RxSampleQueue.cpp ../../RxStreamSession.cpp)
+    support/TestMain.cpp component/RxLifecycleTests.cpp ../../RxSampleQueue.cpp ../../RxStreamSession.cpp ../../RxBlockAligner.cpp)
 target_include_directories(rx_lifecycle_tests PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/support" "${CMAKE_CURRENT_SOURCE_DIR}/../../include"
     "${CMAKE_CURRENT_BINARY_DIR}")
@@ -543,6 +543,13 @@ else()
     message(STATUS "Python3 interpreter not found; tooling tests skipped. Set Python3_EXECUTABLE to enable them.")
 endif()
 
+
+add_executable(rx_block_aligner_tests support/TestMain.cpp unit/RxBlockAlignerTests.cpp ../../RxBlockAligner.cpp)
+target_include_directories(rx_block_aligner_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/support" "${CMAKE_CURRENT_SOURCE_DIR}/../../include")
+target_link_libraries(rx_block_aligner_tests PRIVATE non_hardware_test_options)
+add_test(NAME rx-block-aligner.all COMMAND rx_block_aligner_tests)
+set_tests_properties(rx-block-aligner.all PROPERTIES LABELS "unit;non-hardware")
+
 add_custom_target(non_hardware_tests
     COMMAND "${CMAKE_CTEST_COMMAND}" --output-on-failure
     DEPENDS discovery_tests device_option_tests sensor_tests sdk_logging_tests
@@ -551,5 +558,5 @@ add_custom_target(non_hardware_tests
             time_readback_tests time_setting_tests pps_source_tests clock_tests settings_tests
             tx_callback_initialization_tests stream_configuration_tests
             stream_conversion_tests rx_sample_queue_tests rx_sample_queue_portable_tests
-            rx_stream_session_tests tx_write_tests timestamp_portable_tests rx_lifecycle_tests
+            rx_stream_session_tests rx_block_aligner_tests tx_write_tests timestamp_portable_tests rx_lifecycle_tests
     USES_TERMINAL)

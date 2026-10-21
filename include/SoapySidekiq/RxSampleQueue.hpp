@@ -57,13 +57,14 @@ struct RxReadResult
  */
 class RxSampleQueue
 {
-public:
+  public:
     /**
      * Construct an inactive queue.
-     * @param capacity_blocks Maximum number of retained hardware blocks.
-     * @throws std::invalid_argument when capacity_blocks is zero.
+     * @param capacity_blocks Maximum number of retained aligned blocks.
+     * @param channel_count Number of sample planes returned together.
+     * @throws std::invalid_argument when capacity or channel count is zero.
      */
-    explicit RxSampleQueue(std::size_t capacity_blocks);
+    explicit RxSampleQueue(std::size_t capacity_blocks, std::size_t channel_count = 1);
 
     /** Begin a fresh session, discarding data and lifecycle state from the last one. */
     void start();
@@ -136,6 +137,21 @@ public:
                            TimestampRate timestamp_frequency, TimestampRate sample_rate);
 
     /**
+     * Queue one aligned group of equally sized planar CS16 channel buffers.
+     * A single queue entry owns all planes, so eviction/read boundaries cannot
+     * separate channels. timestamp_sample_offset retains a cropped first
+     * channel's exact sample offset relative to its hardware timestamp.
+     */
+    RxPushStatus pushChannelsTicks(std::vector<std::vector<std::int16_t>> samples,
+                                   std::uint64_t timestamp, TimestampRate timestamp_frequency,
+                                   TimestampRate sample_rate,
+                                   std::uint64_t timestamp_sample_offset = 0);
+
+    /** Read all configured planes atomically; outputs contains channel_count pointers. */
+    RxReadResult readChannels(std::int16_t *const *outputs, std::size_t requested_samples,
+                              std::chrono::microseconds timeout);
+
+    /**
      * Read up to requested_samples interleaved complex samples.
      *
      * A successful result may span contiguous blocks. Its timestamp describes the
@@ -150,10 +166,8 @@ public:
      * @throws std::invalid_argument for a nonempty null output or negative timeout.
      * @throws std::overflow_error when an adjusted timestamp exceeds int64_t.
      */
-    RxReadResult read(
-        std::int16_t *output,
-        std::size_t requested_samples,
-        std::chrono::microseconds timeout);
+    RxReadResult read(std::int16_t *output, std::size_t requested_samples,
+                      std::chrono::microseconds timeout);
 
     /** @return Whether the queue is accepting producer blocks. */
     bool running() const;
@@ -164,12 +178,13 @@ public:
     /** @return Number of oldest blocks discarded in the current session. */
     std::size_t droppedBlocks() const;
 
-private:
+  private:
     /** An owned CS16 block plus the next unread complex-sample offset. */
     struct Block
     {
-        std::vector<std::int16_t> samples;
+        std::vector<std::vector<std::int16_t>> channel_samples;
         std::size_t offset{};
+        std::uint64_t timestamp_sample_offset{};
         bool discontinuity_before{};
         std::int64_t time_ns{};
         TimestampRate sample_rate{};
@@ -183,6 +198,11 @@ private:
                                TimestampRate sample_rate, std::uint64_t remainder,
                                std::uint64_t denominator);
 
+    RxPushStatus pushChannelsWithPhase(std::vector<std::vector<std::int16_t>> samples,
+                                       std::int64_t time_ns, TimestampRate sample_rate,
+                                       std::uint64_t remainder, std::uint64_t denominator,
+                                       std::uint64_t timestamp_sample_offset);
+
     /**
      * Calculate the timestamp of the next unread sample in a block.
      * @param block Queue block whose current offset is being reported.
@@ -192,6 +212,7 @@ private:
     std::int64_t blockTime(const Block &block) const;
 
     const std::size_t capacity_blocks_;
+    const std::size_t channel_count_;
     mutable std::mutex mutex_;
     std::condition_variable data_available_;
     std::deque<Block> blocks_;

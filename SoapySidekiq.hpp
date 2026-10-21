@@ -255,6 +255,8 @@ class SoapySidekiq : public SoapySDR::Device
         size_t channel;
         skiq_rx_hdl_t rx_handle;
         skiq_tx_hdl_t tx_handle;
+        std::vector<size_t> channels{};
+        std::vector<skiq_rx_hdl_t> rx_handles{};
     };
 
   private:

@@ -33,15 +33,17 @@ struct StreamRequest
     StreamDirection direction;
     /** Parsed sample format. */
     StreamFormat format;
-    /** Single logical channel selected for this stream. */
+    /** First logical channel selected for this stream. */
     std::size_t channel;
+    /** Selected channels in the caller's buffer order. */
+    std::vector<std::size_t> channels{};
 };
 
 /**
  * Validate and normalize a Soapy stream request before hardware side effects.
  *
- * An omitted channel selects channel zero. Only one channel and one stream per
- * direction are currently supported.
+ * An omitted channel selects channel zero. RX accepts multiple distinct channels; TX accepts one
+ * channel. One stream per direction is supported.
  *
  * @param direction Requested receive or transmit direction.
  * @param format SoapySDR sample-format name.
@@ -50,7 +52,8 @@ struct StreamRequest
  * @param stream_already_configured Whether this direction already owns a stream.
  * @return Normalized format, direction, and selected channel.
  * @throws std::logic_error when a stream already exists in this direction.
- * @throws std::invalid_argument for unsupported formats or multiple channels.
+ * @throws std::invalid_argument for unsupported formats, duplicate RX channels, or multiple TX
+ * channels.
  * @throws std::out_of_range when the selected channel is unavailable.
  */
 StreamRequest validateStreamRequest(

@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <utility>
+#include <limits>
 #include <vector>
 
 namespace soapy_sidekiq
@@ -35,6 +36,43 @@ int SidekiqRxBackend::stop(const std::uint32_t handle, const bool on_pps)
     return on_pps
         ? skiq_stop_rx_streaming_on_1pps(card_, rx_handle, 0)
         : skiq_stop_rx_streaming(card_, rx_handle);
+}
+
+int SidekiqRxBackend::startMulti(const std::vector<std::uint32_t> &handles, const bool on_pps)
+{
+    if (handles.empty() || handles.size() > std::numeric_limits<std::uint8_t>::max())
+        return -EINVAL;
+    if (handles.size() == 1)
+        return start(handles.front(), on_pps);
+    std::vector<skiq_rx_hdl_t> native;
+    native.reserve(handles.size());
+    for (const auto handle : handles)
+        native.push_back(static_cast<skiq_rx_hdl_t>(handle));
+    // RX-only APIs: a topology group may contain TX handles as well.
+    return on_pps
+               ? skiq_start_rx_streaming_multi_on_trigger(card_, native.data(),
+                                                          static_cast<std::uint8_t>(native.size()),
+                                                          skiq_trigger_src_1pps, 0)
+               : skiq_start_rx_streaming_multi_synced(card_, native.data(),
+                                                      static_cast<std::uint8_t>(native.size()));
+}
+
+int SidekiqRxBackend::stopMulti(const std::vector<std::uint32_t> &handles, const bool on_pps)
+{
+    if (handles.empty() || handles.size() > std::numeric_limits<std::uint8_t>::max())
+        return -EINVAL;
+    if (handles.size() == 1)
+        return stop(handles.front(), on_pps);
+    std::vector<skiq_rx_hdl_t> native;
+    native.reserve(handles.size());
+    for (const auto handle : handles)
+        native.push_back(static_cast<skiq_rx_hdl_t>(handle));
+    return on_pps
+               ? skiq_stop_rx_streaming_multi_on_trigger(card_, native.data(),
+                                                         static_cast<std::uint8_t>(native.size()),
+                                                         skiq_trigger_src_1pps, 0)
+               : skiq_stop_rx_streaming_multi_immediate(card_, native.data(),
+                                                        static_cast<std::uint8_t>(native.size()));
 }
 
 RxReceiveResult SidekiqRxBackend::receive()

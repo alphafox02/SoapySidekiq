@@ -14,6 +14,8 @@
 #include <new>
 #include <chrono>
 #include <limits>
+#include <algorithm>
+#include <array>
 
 #include "SoapySidekiq.hpp"
 #include <SoapySDR/Formats.hpp>
@@ -241,12 +243,68 @@ SoapySDR::Stream *SoapySidekiq::setupStream(const int direction,
             throw std::runtime_error("only one RX stream per device is currently supported");
         }
 
-        //  check the channel configuration
-        if (channels.size() > 1)
+        std::vector<skiq_rx_hdl_t> rx_handles;
+        for (const auto selected : request.channels)
+            rx_handles.push_back(getRxHandle(selected));
+        const auto rx_handle = rx_handles.front();
+        if (rx_handles.size() > 1)
         {
-            throw std::runtime_error("multi-channel RX streams are not currently supported");
+            for (const auto handle : rx_handles)
+            {
+                std::array<skiq_rx_hdl_t, skiq_rx_hdl_end> conflicts{};
+                uint8_t count{};
+                const int conflict_status =
+                    skiq_read_rx_stream_handle_conflict(card, handle, conflicts.data(), &count);
+                if (conflict_status != 0 || count > conflicts.size())
+                    throw std::runtime_error("cannot read RX handle conflicts: " +
+                                             std::to_string(conflict_status));
+                for (std::size_t index = 0; index < count; ++index)
+                    if (std::find(rx_handles.begin(), rx_handles.end(), conflicts[index]) !=
+                        rx_handles.end())
+                        throw std::invalid_argument(
+                            "selected RX channels cannot stream simultaneously");
+            }
+            double reference_rate = 0;
+            for (const auto handle : rx_handles)
+            {
+                uint32_t configured{}, bandwidth{}, actual_bandwidth{};
+                double actual = std::numeric_limits<double>::quiet_NaN();
+                const int read_status = skiq_read_rx_sample_rate_and_bandwidth(
+                    card, handle, &configured, &actual, &bandwidth, &actual_bandwidth);
+                if (read_status != 0)
+                    throw std::runtime_error("cannot read multi-channel RX sample rate: " +
+                                             std::to_string(read_status));
+                (void)soapy_sidekiq::TimestampRate::fromActualRate(actual);
+                if (reference_rate != 0 && actual != reference_rate)
+                    throw std::invalid_argument(
+                        "multi-channel RX requires equal actual sample rates");
+                reference_rate = actual;
+            }
         }
-        skiq_rx_hdl_t rx_handle = getRxHandle(channel);
+        // Allocate every host resource before changing card configuration.
+        auto session =
+            std::make_unique<soapy_sidekiq::RxStreamSession>(*rx_backend, 64, rx_handles.size());
+        auto stream_handle = std::make_unique<StreamHandle>();
+        stream_handle->direction = direction;
+        stream_handle->channel = channel;
+        stream_handle->rx_handle = rx_handle;
+        stream_handle->tx_handle = skiq_tx_hdl_end;
+        stream_handle->channels = request.channels;
+        stream_handle->rx_handles = rx_handles;
+        skiq_chan_mode_t mode{};
+        const int mode_status = skiq_read_chan_mode(card, &mode);
+        if (mode_status != 0)
+            throw std::runtime_error("cannot read RX channel mode: " + std::to_string(mode_status));
+        const auto required_mode =
+            std::find(rx_handles.begin(), rx_handles.end(), skiq_rx_hdl_A2) != rx_handles.end()
+                ? skiq_chan_mode_dual
+                : skiq_chan_mode_single;
+        if (mode != required_mode)
+        {
+            std::lock_guard<std::mutex> lock(tx_mutex);
+            if (tx_stream_active || (_tx_streaming_thread.joinable() && !tx_start_finished))
+                throw std::runtime_error("cannot change RX channel mode while TX is active");
+        }
 
         SoapySDR_logf(SOAPY_SDR_INFO, "RX channel %zu uses handle %u", channel, rx_handle);
 
@@ -320,12 +378,14 @@ SoapySDR::Stream *SoapySidekiq::setupStream(const int direction,
             throw std::runtime_error("");
         }
 
-        // Keep the handle locally owned until RX setup is ready to publish it.
-        auto stream_handle = std::make_unique<StreamHandle>();
-        stream_handle->direction = direction;
-        stream_handle->channel = channel;
-        stream_handle->rx_handle = rx_handle;
-        stream_handle->tx_handle = skiq_tx_hdl_end;
+        if (mode != required_mode)
+        {
+            const int write_status = skiq_write_chan_mode(card, required_mode);
+            if (write_status != 0)
+                throw std::runtime_error("cannot configure RX channel mode: " +
+                                         std::to_string(write_status));
+        }
+        rx_session = std::move(session);
         active_rx_stream = stream_handle.release();
         return reinterpret_cast<SoapySDR::Stream *>(active_rx_stream);
     }
@@ -542,6 +602,20 @@ int SoapySidekiq::activateStream(SoapySDR::Stream *stream,
             throw std::runtime_error(
                 "RX activation rate read failed (card " + std::to_string(card) + ", handle " +
                 std::to_string(rx_handle) + "): " + std::to_string(rate_status));
+        for (const auto handle : stream_handle->rx_handles)
+        {
+            if (handle == rx_handle)
+                continue;
+            double other_rate = std::numeric_limits<double>::quiet_NaN();
+            const int read_status =
+                skiq_read_rx_sample_rate_and_bandwidth(card, handle, &configured_rate, &other_rate,
+                                                       &configured_bandwidth, &actual_bandwidth);
+            if (read_status != 0)
+                throw std::runtime_error("multi-channel RX activation rate read failed: " +
+                                         std::to_string(read_status));
+            if (other_rate != actual_rate)
+                throw std::invalid_argument("multi-channel RX requires equal actual sample rates");
+        }
         const auto sample_rate = soapy_sidekiq::TimestampRate::fromActualRate(actual_rate);
         uint64_t system_frequency = rfTimeSource ? sys_freq : 0;
         if (!rfTimeSource)
@@ -552,9 +626,15 @@ int SoapySidekiq::activateStream(SoapySDR::Stream *stream,
                                          std::to_string(read_status));
         }
         // The session starts hardware before publishing or creating a worker.
-        status = rx_session->activate({static_cast<uint32_t>(rx_handle), rx_payload_size_in_words,
-                                       sample_rate, system_frequency, rfTimeSource,
-                                       (flags & SOAPY_SDR_HAS_TIME) != 0});
+        soapy_sidekiq::RxSessionConfiguration configuration{static_cast<uint32_t>(rx_handle),
+                                                            rx_payload_size_in_words,
+                                                            sample_rate,
+                                                            system_frequency,
+                                                            rfTimeSource,
+                                                            (flags & SOAPY_SDR_HAS_TIME) != 0};
+        for (const auto handle : stream_handle->rx_handles)
+            configuration.handles.push_back(static_cast<uint32_t>(handle));
+        status = rx_session->activate(configuration);
         if (status != 0)
         {
             SoapySDR_logf(SOAPY_SDR_ERROR,
@@ -809,34 +889,31 @@ int SoapySidekiq::readStream(SoapySDR::Stream *stream,
     {
         return SOAPY_SDR_OVERFLOW;
     }
-    if (timeoutUs < 0 ||
-        (numElems != 0 && (buffs == nullptr || buffs[0] == nullptr)))
-    {
+    const auto channel_count =
+        stream_handle->rx_handles.empty() ? std::size_t{1} : stream_handle->rx_handles.size();
+    if (timeoutUs < 0 || (numElems != 0 && buffs == nullptr))
         return SOAPY_SDR_STREAM_ERROR;
-    }
-
-    // The queue stores native CS16; CF32 requests use a temporary conversion buffer.
-    std::vector<int16_t> converted_samples;
-    int16_t *queue_output = nullptr;
     if (numElems != 0)
-    {
-        if (rxUseShort)
-        {
-            queue_output = static_cast<int16_t *>(buffs[0]);
-        }
-        else
-        {
-            converted_samples.resize(numElems * 2);
-            queue_output = converted_samples.data();
-        }
-    }
+        for (std::size_t channel = 0; channel < channel_count; ++channel)
+            if (buffs[channel] == nullptr)
+                return SOAPY_SDR_STREAM_ERROR;
 
-    // Session read honors the requested timeout and translates worker lifecycle
-    // transitions into stable queue statuses for the SoapySDR API.
-    const auto result = rx_session->read(
-        queue_output,
-        numElems,
-        std::chrono::microseconds(timeoutUs));
+    // One queue transaction consumes the same sample interval on every plane.
+    std::vector<std::vector<int16_t>> converted_samples(rxUseShort ? 0 : channel_count);
+    std::vector<int16_t *> queue_outputs(channel_count, nullptr);
+    if (numElems != 0)
+        for (std::size_t channel = 0; channel < channel_count; ++channel)
+        {
+            if (rxUseShort)
+                queue_outputs[channel] = static_cast<int16_t *>(buffs[channel]);
+            else
+            {
+                converted_samples[channel].resize(numElems * 2);
+                queue_outputs[channel] = converted_samples[channel].data();
+            }
+        }
+    const auto result = rx_session->readChannels(queue_outputs.data(), numElems,
+                                                 std::chrono::microseconds(timeoutUs));
     if (result.status == soapy_sidekiq::RxReadStatus::timeout)
     {
         return SOAPY_SDR_TIMEOUT;
@@ -850,11 +927,12 @@ int SoapySidekiq::readStream(SoapySDR::Stream *stream,
 
     if (!rxUseShort && result.samples != 0)
     {
-        float *output = static_cast<float *>(buffs[0]);
-        for (size_t index = 0; index < result.samples * 2; ++index)
+        for (std::size_t channel = 0; channel < channel_count; ++channel)
         {
-            output[index] = static_cast<float>(converted_samples[index]) /
-                static_cast<float>(maxValue);
+            float *output = static_cast<float *>(buffs[channel]);
+            for (size_t index = 0; index < result.samples * 2; ++index)
+                output[index] = static_cast<float>(converted_samples[channel][index]) /
+                                static_cast<float>(maxValue);
         }
     }
     if (result.has_time)

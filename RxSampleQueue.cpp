@@ -14,12 +14,12 @@
 
 namespace soapy_sidekiq
 {
-RxSampleQueue::RxSampleQueue(const std::size_t capacity_blocks)
-    : capacity_blocks_(capacity_blocks)
+RxSampleQueue::RxSampleQueue(const std::size_t capacity_blocks, const std::size_t channel_count)
+    : capacity_blocks_(capacity_blocks), channel_count_(channel_count)
 {
-    if (capacity_blocks_ == 0)
+    if (capacity_blocks_ == 0 || channel_count_ == 0)
     {
-        throw std::invalid_argument("RX queue capacity must be positive");
+        throw std::invalid_argument("RX queue capacity and channel count must be positive");
     }
 }
 
@@ -120,13 +120,44 @@ RxPushStatus RxSampleQueue::pushWithPhase(std::vector<std::int16_t> samples,
                                           const std::uint64_t remainder,
                                           const std::uint64_t denominator)
 {
-    if (samples.empty() || samples.size() % 2 != 0)
+    std::vector<std::vector<std::int16_t>> planes;
+    planes.push_back(std::move(samples));
+    return pushChannelsWithPhase(std::move(planes), time_ns, sample_rate, remainder, denominator,
+                                 0);
+}
+
+RxPushStatus RxSampleQueue::pushChannelsTicks(std::vector<std::vector<std::int16_t>> samples,
+                                              const std::uint64_t timestamp,
+                                              const TimestampRate timestamp_frequency,
+                                              const TimestampRate sample_rate,
+                                              const std::uint64_t timestamp_sample_offset)
+{
+    const auto phase = timestamp_frequency.convert(timestamp);
+    return pushChannelsWithPhase(std::move(samples), phase.nanoseconds, sample_rate,
+                                 phase.remainder, phase.denominator, timestamp_sample_offset);
+}
+
+RxPushStatus RxSampleQueue::pushChannelsWithPhase(std::vector<std::vector<std::int16_t>> samples,
+                                                  const std::int64_t time_ns,
+                                                  const TimestampRate sample_rate,
+                                                  const std::uint64_t remainder,
+                                                  const std::uint64_t denominator,
+                                                  const std::uint64_t timestamp_sample_offset)
+{
+    if (samples.size() != channel_count_)
+        throw std::invalid_argument("RX sample plane count differs from the configured channels");
+    const auto components = samples.front().size();
+    if (components == 0 || components % 2 != 0)
         throw std::invalid_argument("RX sample data must contain complete IQ pairs");
+    for (const auto &plane : samples)
+        if (plane.size() != components)
+            throw std::invalid_argument("RX sample planes must have equal lengths");
     if (!sample_rate.valid())
         throw std::invalid_argument("RX sample rate cannot be zero");
 
     Block block;
-    block.samples = std::move(samples);
+    block.channel_samples = std::move(samples);
+    block.timestamp_sample_offset = timestamp_sample_offset;
     block.time_ns = time_ns;
     block.sample_rate = sample_rate;
     block.time_remainder = remainder;
@@ -163,7 +194,10 @@ RxPushStatus RxSampleQueue::pushWithPhase(std::vector<std::int16_t> samples,
 std::int64_t RxSampleQueue::blockTime(const Block &block) const
 {
     // offset counts complex samples, which advance RF time by one tick each.
-    const auto offset_phase = block.sample_rate.convert(block.offset);
+    if (block.offset > std::numeric_limits<std::uint64_t>::max() - block.timestamp_sample_offset)
+        throw std::overflow_error("RX timestamp sample offset does not fit uint64_t");
+    const auto offset_phase = block.sample_rate.convert(block.timestamp_sample_offset +
+                                                        static_cast<std::uint64_t>(block.offset));
     const auto offset_ns = offset_phase.nanoseconds;
     if (offset_ns > 0 &&
         block.time_ns > std::numeric_limits<std::int64_t>::max() - offset_ns)
@@ -194,9 +228,23 @@ RxReadResult RxSampleQueue::read(
     const std::size_t requested_samples,
     const std::chrono::microseconds timeout)
 {
-    if (requested_samples != 0 && output == nullptr)
+    if (channel_count_ != 1)
+        throw std::logic_error("use readChannels for a multi-channel RX queue");
+    std::int16_t *outputs[]{output};
+    return readChannels(outputs, requested_samples, timeout);
+}
+
+RxReadResult RxSampleQueue::readChannels(std::int16_t *const *outputs,
+                                         const std::size_t requested_samples,
+                                         const std::chrono::microseconds timeout)
+{
+    if (requested_samples != 0)
     {
-        throw std::invalid_argument("RX output cannot be null");
+        if (outputs == nullptr)
+            throw std::invalid_argument("RX outputs cannot be null");
+        for (std::size_t channel = 0; channel < channel_count_; ++channel)
+            if (outputs[channel] == nullptr)
+                throw std::invalid_argument("RX output cannot be null");
     }
     if (timeout.count() < 0)
     {
@@ -233,14 +281,14 @@ RxReadResult RxSampleQueue::read(
         Block &block = blocks_.front();
         if (block.discontinuity_before)
             break;
-        const std::size_t block_samples = block.samples.size() / 2;
+        const std::size_t block_samples = block.channel_samples.front().size() / 2;
         const std::size_t available = block_samples - block.offset;
         const std::size_t to_copy =
             std::min(available, requested_samples - result.samples);
-        std::memcpy(
-            output + result.samples * 2,
-            block.samples.data() + block.offset * 2,
-            to_copy * 2 * sizeof(std::int16_t));
+        for (std::size_t channel = 0; channel < channel_count_; ++channel)
+            std::memcpy(outputs[channel] + result.samples * 2,
+                        block.channel_samples[channel].data() + block.offset * 2,
+                        to_copy * 2 * sizeof(std::int16_t));
         block.offset += to_copy;
         result.samples += to_copy;
         if (block.offset == block_samples)

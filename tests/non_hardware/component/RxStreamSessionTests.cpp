@@ -66,6 +66,18 @@ public:
         return stop_status;
     }
 
+    int startMulti(const std::vector<std::uint32_t> &handles, bool on_pps) override
+    {
+        started_handles = handles;
+        return start(handles.front(), on_pps);
+    }
+    int stopMulti(const std::vector<std::uint32_t> &handles, bool on_pps) override
+    {
+        stopped_handles = handles;
+        return stop(handles.front(), on_pps);
+    }
+    std::vector<std::uint32_t> started_handles, stopped_handles;
+
     /** @copydoc RxStreamBackend::receive */
     RxReceiveResult receive() override
     {
@@ -470,4 +482,104 @@ TEST_CASE("RX stop retry may choose immediate cleanup after a PPS stop failure")
     REQUIRE_EQ(session.deactivate(), 0);
     REQUIRE(!backend.stopped_on_pps);
     REQUIRE_EQ(backend.stop_calls, 2);
+}
+
+TEST_CASE("multi RX session starts and stops all handles in requested buffer order")
+{
+    FakeRxBackend backend;
+    RxStreamSession session(backend, 4, 2);
+    auto config = configuration();
+    config.handles = {8, 7};
+    REQUIRE_EQ(session.activate(config), 0);
+    REQUIRE((backend.started_handles == std::vector<std::uint32_t>{8, 7}));
+    backend.enqueue(samples(7, {11, 12, 13, 14}, 20));
+    backend.enqueue(samples(9, {99, 99}, 0)); // Ignore even malformed unselected packets.
+    backend.enqueue(samples(8, {1, 2, 3, 4}, 20));
+    std::int16_t a[4]{}, b[4]{};
+    std::int16_t *outputs[]{a, b};
+    const auto result = session.readChannels(outputs, 2, 250ms);
+    REQUIRE(result.status == RxReadStatus::samples);
+    REQUIRE_EQ(result.samples, std::size_t{2});
+    REQUIRE_EQ(result.time_ns, std::int64_t{1000});
+    REQUIRE_EQ(a[0], std::int16_t{1});
+    REQUIRE_EQ(b[0], std::int16_t{11});
+    REQUIRE_EQ(session.deactivate(true), 0);
+    REQUIRE(backend.stopped_handles == backend.started_handles);
+    REQUIRE(backend.stopped_on_pps);
+}
+
+TEST_CASE("multi RX session validates its channel ownership before starting hardware")
+{
+    FakeRxBackend backend;
+    RxStreamSession session(backend, 4, 2);
+    auto config = configuration();
+    REQUIRE_THROWS_AS(session.activate(config), std::invalid_argument);
+    config.handles = {7, 7};
+    REQUIRE_THROWS_AS(session.activate(config), std::invalid_argument);
+    config.handles = {7, 8, 9};
+    REQUIRE_THROWS_AS(session.activate(config), std::invalid_argument);
+    REQUIRE_EQ(backend.start_calls, 0);
+}
+
+TEST_CASE("multi RX session reports loss once and resumes with aligned sample planes")
+{
+    FakeRxBackend backend;
+    RxStreamSession session(backend, 8, 2);
+    auto config = configuration();
+    config.handles = {7, 8};
+    REQUIRE_EQ(session.activate(config), 0);
+    backend.enqueue(samples(7, {1, 2, 3, 4}, 0));
+    backend.enqueue(samples(8, {11, 12, 13, 14}, 0));
+    std::int16_t a[4]{}, b[4]{};
+    std::int16_t *outputs[]{a, b};
+    REQUIRE_EQ(session.readChannels(outputs, 2, 250ms).samples, std::size_t{2});
+    backend.enqueue(samples(7, {5, 6, 7, 8}, 2));
+    backend.enqueue({RxReceiveStatus::overrun, 0, {}, 0, 0, 0});
+    backend.enqueue(samples(7, {9, 10, 11, 12}, 4));
+    backend.enqueue(samples(8, {19, 20, 21, 22}, 4));
+    REQUIRE(session.readChannels(outputs, 2, 250ms).status == RxReadStatus::overflow);
+    REQUIRE_EQ(session.readChannels(outputs, 2, 250ms).samples, std::size_t{2});
+    REQUIRE_EQ(a[0], std::int16_t{9});
+    REQUIRE_EQ(b[0], std::int16_t{19});
+    REQUIRE_EQ(session.hardwareOverruns(), std::size_t{1});
+    REQUIRE_EQ(session.timestampDiscontinuities(), std::size_t{1});
+    REQUIRE_EQ(session.deactivate(), 0);
+}
+
+TEST_CASE("multi RX uses channel zero's exact system phase after RF alignment")
+{
+    FakeRxBackend backend;
+    RxStreamSession session(backend, 4, 2);
+    auto config = configuration(false);
+    config.sample_rate = soapy_sidekiq::TimestampRate::fromActualRate(7.5);
+    config.system_timestamp_frequency = 7;
+    config.handles = {7, 8};
+    REQUIRE_EQ(session.activate(config), 0);
+    backend.enqueue(samples(7, {1, 2, 3, 4}, 10, 3));
+    backend.enqueue(samples(8, {11, 12, 13, 14}, 11, 4));
+    std::int16_t a[2]{}, b[2]{};
+    std::int16_t *outputs[]{a, b};
+    REQUIRE(session.readChannels(outputs, 1, 250ms).status == RxReadStatus::overflow);
+    const auto result = session.readChannels(outputs, 1, 250ms);
+    REQUIRE_EQ(result.samples, std::size_t{1});
+    REQUIRE_EQ(result.time_ns, std::int64_t{561904761});
+    REQUIRE_EQ(a[0], std::int16_t{3});
+    REQUIRE_EQ(b[0], std::int16_t{11});
+    REQUIRE_EQ(session.deactivate(), 0);
+}
+
+TEST_CASE("failed multi RX stop retains all handles for an exact ownership retry")
+{
+    FakeRxBackend backend;
+    RxStreamSession session(backend, 4, 2);
+    auto config = configuration();
+    config.handles = {8, 7};
+    REQUIRE_EQ(session.activate(config), 0);
+    backend.stop_status = -EIO;
+    REQUIRE_EQ(session.deactivate(), -EIO);
+    REQUIRE_THROWS_AS(session.activate(config), std::logic_error);
+    REQUIRE(backend.stopped_handles == config.handles);
+    backend.stop_status = 0;
+    REQUIRE_EQ(session.deactivate(), 0);
+    REQUIRE(backend.stopped_handles == config.handles);
 }

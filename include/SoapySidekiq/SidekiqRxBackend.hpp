@@ -28,6 +28,12 @@ public:
     /** @copydoc RxStreamBackend::stop */
     int stop(std::uint32_t handle, bool on_pps) override;
 
+    /** @copydoc RxStreamBackend::startMulti */
+    int startMulti(const std::vector<std::uint32_t> &handles, bool on_pps) override;
+
+    /** @copydoc RxStreamBackend::stopMulti */
+    int stopMulti(const std::vector<std::uint32_t> &handles, bool on_pps) override;
+
     /** @copydoc RxStreamBackend::receive */
     RxReceiveResult receive() override;
 

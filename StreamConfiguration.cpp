@@ -6,6 +6,8 @@
 #include <SoapySidekiq/StreamConfiguration.hpp>
 
 #include <stdexcept>
+#include <algorithm>
+#include <utility>
 #include <string>
 
 namespace soapy_sidekiq
@@ -26,23 +28,22 @@ StreamRequest validateStreamRequest(
                 ? "only one RX stream per device is currently supported"
                 : "only one TX stream per device is currently supported");
     }
-    if (channels.size() > 1)
-    {
-        throw std::invalid_argument(
-            direction == StreamDirection::rx
-                ? "multi-channel RX streams are not currently supported"
-                : "multi-channel TX streams are not currently supported");
-    }
+    if (direction == StreamDirection::tx && channels.size() > 1)
+        throw std::invalid_argument("multi-channel TX streams are not currently supported");
 
     // Soapy's empty channel list convention selects the first logical channel.
-    const std::size_t channel = channels.empty() ? 0 : channels.front();
-    if (channel >= available_channels)
+    auto selected = channels.empty() ? std::vector<std::size_t>{0} : channels;
+    auto unique = selected;
+    std::sort(unique.begin(), unique.end());
+    if (std::adjacent_find(unique.begin(), unique.end()) != unique.end())
+        throw std::invalid_argument("stream channels must be distinct");
+    for (const auto channel : selected)
     {
-        throw std::out_of_range(
-            std::string{direction == StreamDirection::rx ? "RX" : "TX"} +
-            " stream channel " + std::to_string(channel) +
-            " is unavailable; device has " + std::to_string(available_channels) +
-            " channel(s)");
+        if (channel >= available_channels)
+            throw std::out_of_range(std::string{direction == StreamDirection::rx ? "RX" : "TX"} +
+                                    " stream channel " + std::to_string(channel) +
+                                    " is unavailable; device has " +
+                                    std::to_string(available_channels) + " channel(s)");
     }
 
     StreamFormat parsed_format;
@@ -60,7 +61,7 @@ StreamRequest validateStreamRequest(
             "unsupported stream format '" + format + "'; expected CS16 or CF32");
     }
 
-    return {direction, parsed_format, channel};
+    return {direction, parsed_format, selected.front(), std::move(selected)};
 }
 
 } // namespace soapy_sidekiq

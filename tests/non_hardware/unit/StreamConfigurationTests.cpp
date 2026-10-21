@@ -62,11 +62,10 @@ TEST_CASE("stream validation rejects unknown and case-mismatched formats")
         std::invalid_argument);
 }
 
-TEST_CASE("stream validation rejects multiple channels")
+TEST_CASE("stream validation rejects duplicate RX channels and multiple TX channels")
 {
-    REQUIRE_THROWS_AS(
-        validateStreamRequest(StreamDirection::rx, "CS16", {0, 1}, 2, false),
-        std::invalid_argument);
+    REQUIRE_THROWS_AS(validateStreamRequest(StreamDirection::rx, "CS16", {0, 0}, 2, false),
+                      std::invalid_argument);
     REQUIRE_THROWS_AS(
         validateStreamRequest(StreamDirection::tx, "CS16", {0, 1}, 2, false),
         std::invalid_argument);
@@ -97,4 +96,13 @@ TEST_CASE("an active stream is rejected before other request validation")
     REQUIRE_THROWS_AS(
         validateStreamRequest(StreamDirection::rx, "bad", {10, 11}, 0, true),
         std::logic_error);
+}
+
+TEST_CASE("multi RX requests preserve buffer order and validate every channel")
+{
+    const auto request = validateStreamRequest(StreamDirection::rx, "CS16", {2, 0}, 3, false);
+    REQUIRE((request.channels == std::vector<std::size_t>{2, 0}));
+    REQUIRE_EQ(request.channel, std::size_t{2});
+    REQUIRE_THROWS_AS(validateStreamRequest(StreamDirection::rx, "CF32", {0, 3}, 3, false),
+                      std::out_of_range);
 }

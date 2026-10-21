@@ -49,6 +49,10 @@ struct FakeSdk
     unsigned rate_handle{};
     std::uint32_t configured_rate{}, configured_bandwidth{}, actual_bandwidth{};
     bool omit_rate{};
+    std::vector<unsigned> packet_handles{}, started_handles{}, stopped_handles{};
+    std::size_t delivered_packets{};
+    unsigned alternate_handle{99};
+    double alternate_rate{20000000};
     int rate_status{}, frequency_status{};
 } sdk;
 }
@@ -62,7 +66,7 @@ int skiq_read_rx_sample_rate_and_bandwidth(std::uint8_t, skiq_rx_hdl_t handle,
     sdk.rate_handle = handle;
     *configured_rate = sdk.configured_rate;
     if (!sdk.omit_rate)
-        *actual_rate = sdk.actual_rate;
+        *actual_rate = handle == sdk.alternate_handle ? sdk.alternate_rate : sdk.actual_rate;
     *configured_bandwidth = sdk.configured_bandwidth;
     *actual_bandwidth = sdk.actual_bandwidth;
     return sdk.rate_status;
@@ -108,6 +112,16 @@ public:
     { return pps ? skiq_start_rx_streaming_on_1pps(0, handle, 0) : skiq_start_rx_streaming(0, handle); }
     int stop(std::uint32_t handle, bool pps) override
     { return pps ? skiq_stop_rx_streaming_on_1pps(0, handle, 0) : skiq_stop_rx_streaming(0, handle); }
+    int startMulti(const std::vector<std::uint32_t> &handles, bool pps) override
+    {
+        sdk.started_handles = handles;
+        return start(handles.front(), pps);
+    }
+    int stopMulti(const std::vector<std::uint32_t> &handles, bool pps) override
+    {
+        sdk.stopped_handles = handles;
+        return stop(handles.front(), pps);
+    }
     soapy_sidekiq::RxReceiveResult receive() override
     {
         if (sdk.provide_overrun && !sdk.overrun_delivered)
@@ -117,6 +131,20 @@ public:
         }
         if (!sdk.provide_packet)
             throw std::runtime_error("injected receive failure");
+        if (!sdk.packet_handles.empty())
+        {
+            if (sdk.delivered_packets == sdk.packet_handles.size())
+                return {};
+            const auto index = sdk.delivered_packets++;
+            const auto value = static_cast<std::int16_t>(index * 10 + 1);
+            return {soapy_sidekiq::RxReceiveStatus::success,
+                    sdk.packet_handles[index],
+                    {value, static_cast<std::int16_t>(value + 1),
+                     static_cast<std::int16_t>(value + 2), static_cast<std::int16_t>(value + 3)},
+                    sdk.rf_timestamp,
+                    sdk.system_timestamp,
+                    0};
+        }
         if (sdk.delivered)
             return {};
         sdk.delivered = true;
@@ -139,6 +167,7 @@ public:
         skiq_rx_hdl_t rx_handle{};
         skiq_tx_hdl_t tx_handle{};
         std::size_t channel{};
+        std::vector<skiq_rx_hdl_t> rx_handles{};
     };
     std::uint8_t card{};
     bool tx_start_finished{}, tx_stream_active{}, rfTimeSource{true};
@@ -169,10 +198,18 @@ public:
         rx_session.reset();
         delete active_rx_stream;
     }
-    SoapySDR::Stream *setupRx()
+    SoapySDR::Stream *setupRx(const std::vector<unsigned> &handles = {})
     {
         REQUIRE(active_rx_stream == nullptr);
         active_rx_stream = new StreamHandle;
+        if (!handles.empty())
+        {
+            active_rx_stream->rx_handles = handles;
+            active_rx_stream->rx_handle = handles.front();
+            sdk.packet_handles = handles;
+            rx_session =
+                std::make_unique<soapy_sidekiq::RxStreamSession>(backend, 4, handles.size());
+        }
         return reinterpret_cast<SoapySDR::Stream *>(active_rx_stream);
     }
     void awaitWorkerFailure()
@@ -513,4 +550,57 @@ TEST_CASE("failed RX deactivation returns a stream error and preserves hardware 
         device.closeStream(stream);
         REQUIRE(device.active_rx_stream == nullptr);
     }
+}
+
+TEST_CASE("production multi RX validates every buffer before returning planar CS16 and CF32")
+{
+    for (const bool cs16 : {true, false})
+    {
+        SoapySidekiq device;
+        sdk.provide_packet = true;
+        device.rxUseShort = cs16;
+        auto *stream = device.setupRx({2, 0});
+        REQUIRE_EQ(device.activateStream(stream, 0, 0, 0), 0);
+        REQUIRE((sdk.started_handles == std::vector<unsigned>{2, 0}));
+        std::int16_t a[4]{99, 99, 99, 99}, b[4]{};
+        float af[4]{99, 99, 99, 99}, bf[4]{};
+        void *outputs[]{cs16 ? static_cast<void *>(a) : static_cast<void *>(af), nullptr};
+        int flags = 0;
+        long long timestamp = 0;
+        REQUIRE_EQ(device.readStream(stream, outputs, 2, flags, timestamp, 250000),
+                   SOAPY_SDR_STREAM_ERROR);
+        REQUIRE_EQ(a[0], std::int16_t{99});
+        REQUIRE_EQ(af[0], 99.0f);
+        outputs[1] = cs16 ? static_cast<void *>(b) : static_cast<void *>(bf);
+        REQUIRE_EQ(device.readStream(stream, outputs, 1, flags, timestamp, 250000), 1);
+        REQUIRE_EQ(timestamp, 50LL);
+        REQUIRE_EQ(flags, SOAPY_SDR_HAS_TIME);
+        if (cs16)
+        {
+            REQUIRE_EQ(a[0], std::int16_t{1});
+            REQUIRE_EQ(b[0], std::int16_t{11});
+        }
+        else
+        {
+            REQUIRE_EQ(af[0], 1.0f / 2048);
+            REQUIRE_EQ(bf[0], 11.0f / 2048);
+        }
+        REQUIRE_EQ(device.readStream(stream, outputs, 1, flags, timestamp, 250000), 1);
+        REQUIRE_EQ(timestamp, 100LL);
+        REQUIRE_EQ(device.deactivateStream(stream, 0, 0), 0);
+        REQUIRE(sdk.stopped_handles == sdk.started_handles);
+        device.closeStream(stream);
+    }
+}
+
+TEST_CASE("production multi RX rechecks all actual rates before starting hardware")
+{
+    SoapySidekiq device;
+    auto *stream = device.setupRx({0, 2});
+    sdk.alternate_handle = 2;
+    sdk.alternate_rate = 10000000;
+    REQUIRE_THROWS_AS(device.activateStream(stream, 0, 0, 0), std::invalid_argument);
+    REQUIRE_EQ(sdk.starts, 0u);
+    REQUIRE_EQ(sdk.rate_reads, 2u);
+    device.closeStream(stream);
 }

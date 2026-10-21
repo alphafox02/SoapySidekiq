@@ -8,6 +8,7 @@
 #include <SoapySidekiq/RxSampleQueue.hpp>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -47,7 +48,7 @@ struct RxReceiveResult
 /** Hardware boundary used by RxStreamSession and its non-hardware tests. */
 class RxStreamBackend
 {
-public:
+  public:
     virtual ~RxStreamBackend() = default;
 
     /**
@@ -65,6 +66,18 @@ public:
      * @return Backend status code; zero indicates success.
      */
     virtual int stop(std::uint32_t handle, bool on_pps) = 0;
+
+    /** Start selected handles as one synchronized RX-only operation. */
+    virtual int startMulti(const std::vector<std::uint32_t> &handles, bool on_pps)
+    {
+        return handles.size() == 1 ? start(handles.front(), on_pps) : -ENOTSUP;
+    }
+
+    /** Stop every handle owned by this session, retaining ownership on failure. */
+    virtual int stopMulti(const std::vector<std::uint32_t> &handles, bool on_pps)
+    {
+        return handles.size() == 1 ? stop(handles.front(), on_pps) : -ENOTSUP;
+    }
 
     /**
      * Wait for and normalize the next hardware receive result.
@@ -88,6 +101,8 @@ struct RxSessionConfiguration
     bool use_rf_timestamp{true};
     /** Synchronize hardware start to PPS; stopping has its own mode. */
     bool on_pps{};
+    /** Requested buffer order; empty retains the single-handle API. */
+    std::vector<std::uint32_t> handles{};
 };
 
 /**
@@ -97,16 +112,16 @@ struct RxSessionConfiguration
  */
 class RxStreamSession
 {
-public:
+  public:
     /**
      * Construct a session around a backend that must outlive this object.
      * @param backend Hardware adapter used by the worker thread.
      * @param queue_capacity_blocks Maximum number of queued hardware blocks.
-     * @throws std::invalid_argument when queue_capacity_blocks is zero.
+     * @param channel_count Number of selected channel planes in each read.
+     * @throws std::invalid_argument when capacity or channel count is zero.
      */
-    explicit RxStreamSession(
-        RxStreamBackend &backend,
-        std::size_t queue_capacity_blocks = 64);
+    explicit RxStreamSession(RxStreamBackend &backend, std::size_t queue_capacity_blocks = 64,
+                             std::size_t channel_count = 1);
 
     /** Stop the backend and join the receive worker if still active. */
     ~RxStreamSession();
@@ -142,10 +157,12 @@ public:
      * @param timeout Maximum wait for samples or a lifecycle transition.
      * @return Queue result containing status, count, and timestamp metadata.
      */
-    RxReadResult read(
-        std::int16_t *output,
-        std::size_t requested_samples,
-        std::chrono::microseconds timeout);
+    RxReadResult read(std::int16_t *output, std::size_t requested_samples,
+                      std::chrono::microseconds timeout);
+
+    /** Read equal sample counts into all selected channel planes. */
+    RxReadResult readChannels(std::int16_t *const *outputs, std::size_t requested_samples,
+                              std::chrono::microseconds timeout);
 
     /** @return True while the receive worker should continue running. */
     bool running() const;
@@ -162,7 +179,7 @@ public:
     /** @return Backend error code saved by the receive worker, or zero. */
     int receiveError() const;
 
-private:
+  private:
     /**
      * Worker entry point; all failures are translated into session state.
      * @param configuration Immutable settings copied into the worker thread.
@@ -173,6 +190,7 @@ private:
     RxStreamBackend &backend_;
     /** Synchronized producer/consumer handoff owned by this session. */
     RxSampleQueue queue_;
+    const std::size_t queue_capacity_, channel_count_;
     mutable std::mutex lifecycle_mutex_;
     std::thread receive_thread_;
     std::atomic<bool> running_{};

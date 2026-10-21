@@ -4,6 +4,8 @@
  */
 
 #include <SoapySidekiq/RxStreamSession.hpp>
+#include <SoapySidekiq/RxBlockAligner.hpp>
+#include <algorithm>
 #include <SoapySidekiq/TimestampConversion.hpp>
 
 #include <limits>
@@ -15,10 +17,10 @@
 namespace soapy_sidekiq
 {
 
-RxStreamSession::RxStreamSession(
-    RxStreamBackend &backend,
-    const std::size_t queue_capacity_blocks)
-    : backend_(backend), queue_(queue_capacity_blocks)
+RxStreamSession::RxStreamSession(RxStreamBackend &backend, const std::size_t queue_capacity_blocks,
+                                 const std::size_t channel_count)
+    : backend_(backend), queue_(queue_capacity_blocks, channel_count),
+      queue_capacity_(queue_capacity_blocks), channel_count_(channel_count)
 {
 }
 
@@ -45,6 +47,17 @@ int RxStreamSession::activate(const RxSessionConfiguration &configuration)
         throw std::invalid_argument("system timestamp frequency must be positive");
     }
 
+    // Allocate and validate ownership before the first hardware side effect.
+    auto prepared = configuration;
+    if (prepared.handles.empty())
+        prepared.handles.push_back(prepared.handle);
+    if (prepared.handles.size() != channel_count_)
+        throw std::invalid_argument("RX configured handle count differs from its sample planes");
+    auto unique_handles = prepared.handles;
+    std::sort(unique_handles.begin(), unique_handles.end());
+    if (std::adjacent_find(unique_handles.begin(), unique_handles.end()) != unique_handles.end())
+        throw std::invalid_argument("RX handles must be distinct");
+
     // Serialize start/stop so only one worker can own the backend at a time.
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
     if (active_ || receive_thread_.joinable())
@@ -53,13 +66,13 @@ int RxStreamSession::activate(const RxSessionConfiguration &configuration)
     }
 
     // Do not publish active state until hardware start succeeds.
-    const int start_status = backend_.start(configuration.handle, configuration.on_pps);
+    const int start_status = backend_.startMulti(prepared.handles, prepared.on_pps);
     if (start_status != 0)
     {
         return start_status;
     }
 
-    active_configuration_ = configuration;
+    active_configuration_ = std::move(prepared);
     hardware_overruns_.store(0);
     timestamp_discontinuities_.store(0);
     receive_error_.store(0);
@@ -69,8 +82,7 @@ int RxStreamSession::activate(const RxSessionConfiguration &configuration)
     {
         queue_.start();
         running_.store(true);
-        receive_thread_ = std::thread(
-            &RxStreamSession::receiveLoop, this, configuration);
+        receive_thread_ = std::thread(&RxStreamSession::receiveLoop, this, active_configuration_);
     }
     catch (...)
     {
@@ -81,7 +93,7 @@ int RxStreamSession::activate(const RxSessionConfiguration &configuration)
         try
         {
             // Cleanup must not wait for an external PPS edge.
-            const int status = backend_.stop(configuration.handle, false);
+            const int status = backend_.stopMulti(active_configuration_.handles, false);
             if (status == 0 || status == -ENODEV) active_ = false;
         }
         catch (...) {}
@@ -106,7 +118,7 @@ int RxStreamSession::deactivate(const bool on_pps)
     try
     {
         if (active_)
-            stop_status = backend_.stop(active_configuration_.handle, on_pps);
+            stop_status = backend_.stopMulti(active_configuration_.handles, on_pps);
         if (stop_status == 0 || stop_status == -ENODEV) active_ = false;
     }
     catch (...) { stop_error = std::current_exception(); }
@@ -144,6 +156,13 @@ RxReadResult RxStreamSession::read(
     return queue_.read(output, requested_samples, timeout);
 }
 
+RxReadResult RxStreamSession::readChannels(std::int16_t *const *outputs,
+                                           const std::size_t requested_samples,
+                                           const std::chrono::microseconds timeout)
+{
+    return queue_.readChannels(outputs, requested_samples, timeout);
+}
+
 bool RxStreamSession::running() const
 {
     return running_.load();
@@ -176,6 +195,7 @@ void RxStreamSession::receiveLoop(RxSessionConfiguration configuration) noexcept
 
     try
     {
+        RxBlockAligner aligner(channel_count_, queue_capacity_);
         while (running_.load())
         {
             auto result = backend_.receive();
@@ -191,7 +211,10 @@ void RxStreamSession::receiveLoop(RxSessionConfiguration configuration) noexcept
             if (result.status == RxReceiveStatus::overrun)
             {
                 hardware_overruns_.fetch_add(1);
-                queue_.markDiscontinuity();
+                if (channel_count_ == 1)
+                    queue_.markDiscontinuity();
+                else
+                    aligner.markDiscontinuity();
                 continue;
             }
             if (result.status == RxReceiveStatus::error)
@@ -202,7 +225,9 @@ void RxStreamSession::receiveLoop(RxSessionConfiguration configuration) noexcept
                 queue_.fail();
                 break;
             }
-            if (result.handle != configuration.handle)
+            const auto selected = std::find(configuration.handles.begin(),
+                                            configuration.handles.end(), result.handle);
+            if (selected == configuration.handles.end())
             {
                 // A card may deliver another configured handle to this call.
                 continue;
@@ -214,6 +239,30 @@ void RxStreamSession::receiveLoop(RxSessionConfiguration configuration) noexcept
                 running_.store(false);
                 queue_.fail();
                 break;
+            }
+
+            if (channel_count_ > 1)
+            {
+                const auto channel =
+                    static_cast<std::size_t>(selected - configuration.handles.begin());
+                if (aligner.push(channel, std::move(result.samples), result.rf_timestamp,
+                                 result.system_timestamp))
+                    timestamp_discontinuities_.fetch_add(1);
+                while (auto aligned = aligner.pop())
+                {
+                    if (aligned->discontinuity_before)
+                        queue_.markDiscontinuity();
+                    queue_.pushChannelsTicks(
+                        std::move(aligned->channels),
+                        configuration.use_rf_timestamp ? aligned->rf_timestamp
+                                                       : aligned->system_timestamp,
+                        configuration.use_rf_timestamp
+                            ? configuration.sample_rate
+                            : TimestampRate(configuration.system_timestamp_frequency),
+                        configuration.sample_rate,
+                        configuration.use_rf_timestamp ? 0 : aligned->system_sample_offset);
+                }
+                continue;
             }
 
             // Retain valid samples while marking the boundary before them.
