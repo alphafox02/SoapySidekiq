@@ -221,6 +221,13 @@ binary value through the worker and partial-read timestamp calculation.
 Configure rates, clocks, and timestamp selection before activating RX; stop
 and reactivate RX after changing them so it captures a fresh timing snapshot.
 
+RX queue drops, hardware overruns, and RF sample-counter gaps are reported as
+`SOAPY_SDR_OVERFLOW` before returning samples after the loss. Reads that reach
+a gap first return their contiguous prefix; the next read reports the overflow,
+and a subsequent read resumes after the gap. Check negative return codes before
+using the sample buffer or timestamp. The same loss reporting applies with RF
+or system timestamps and with CS16 or CF32 samples.
+
 `getHardwareTime` uses system time for the empty selector or `sys_timestamp`.
 Explicit `rx_rf_timestamp` and `tx_rf_timestamp` read the first mapped handle
 with the SDK's current actual rate, preserving fractional Hz. Missing rates,

@@ -191,6 +191,7 @@ void RxStreamSession::receiveLoop(RxSessionConfiguration configuration) noexcept
             if (result.status == RxReceiveStatus::overrun)
             {
                 hardware_overruns_.fetch_add(1);
+                queue_.markDiscontinuity();
                 continue;
             }
             if (result.status == RxReceiveStatus::error)
@@ -215,7 +216,7 @@ void RxStreamSession::receiveLoop(RxSessionConfiguration configuration) noexcept
                 break;
             }
 
-            // Discontinuities are diagnostic; the valid block is still queued.
+            // Retain valid samples while marking the boundary before them.
             if (have_last_timestamp)
             {
                 const std::uint64_t expected =
@@ -223,6 +224,7 @@ void RxStreamSession::receiveLoop(RxSessionConfiguration configuration) noexcept
                 if (result.rf_timestamp != expected)
                 {
                     timestamp_discontinuities_.fetch_add(1);
+                    queue_.markDiscontinuity();
                 }
             }
             have_last_timestamp = true;

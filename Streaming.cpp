@@ -841,6 +841,8 @@ int SoapySidekiq::readStream(SoapySDR::Stream *stream,
     {
         return SOAPY_SDR_TIMEOUT;
     }
+    if (result.status == soapy_sidekiq::RxReadStatus::overflow)
+        return SOAPY_SDR_OVERFLOW;
     if (result.status != soapy_sidekiq::RxReadStatus::samples)
     {
         return SOAPY_SDR_STREAM_ERROR;

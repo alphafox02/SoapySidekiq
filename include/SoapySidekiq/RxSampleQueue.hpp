@@ -22,6 +22,7 @@ enum class RxReadStatus
 {
     samples,
     timeout,
+    overflow,
     stopped,
     error
 };
@@ -75,6 +76,9 @@ public:
 
     /** Return the queue to its initial inactive, empty state. */
     void reset();
+
+    /** Mark the next queued block as following lost or discontinuous samples. */
+    void markDiscontinuity();
 
     /**
      * Copy one timestamped block into the queue.
@@ -134,8 +138,10 @@ public:
     /**
      * Read up to requested_samples interleaved complex samples.
      *
-     * A successful result may span blocks. Its timestamp always describes the
+     * A successful result may span contiguous blocks. Its timestamp describes the
      * first returned sample, including any offset left by an earlier read.
+     * A marked gap returns overflow once before samples after the gap; a read
+     * that reaches a gap returns its contiguous prefix without crossing it.
      *
      * @param output Destination for interleaved CS16 IQ values.
      * @param requested_samples Maximum number of complex samples to copy.
@@ -164,6 +170,7 @@ private:
     {
         std::vector<std::int16_t> samples;
         std::size_t offset{};
+        bool discontinuity_before{};
         std::int64_t time_ns{};
         TimestampRate sample_rate{};
         // Fractional nanosecond phase lost by the integer time_ns conversion.
@@ -191,6 +198,7 @@ private:
     // All lifecycle and queue fields below are protected by mutex_.
     bool running_{};
     bool failed_{};
+    bool next_block_discontinuous_{};
     std::size_t dropped_blocks_{};
 };
 

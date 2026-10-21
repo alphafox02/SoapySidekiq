@@ -138,6 +138,10 @@ TEST_CASE("bounded RX queue drops the oldest block")
     REQUIRE_EQ(queue.droppedBlocks(), std::size_t{1});
 
     std::array<std::int16_t, 4> output{};
+    const auto gap = queue.read(output.data(), 2, 0us);
+    REQUIRE(gap.status == RxReadStatus::overflow);
+    REQUIRE_EQ(gap.samples, std::size_t{0});
+    REQUIRE(!gap.has_time);
     const auto result = queue.read(output.data(), 2, 0us);
     REQUIRE_EQ(result.samples, std::size_t{2});
     REQUIRE_EQ(result.time_ns, std::int64_t{200});
@@ -162,6 +166,61 @@ TEST_CASE("RX queue start and reset clear lifecycle state")
     queue.reset();
     REQUIRE(!queue.running());
     REQUIRE(queue.push(input.data(), 1, 0, 1) == RxPushStatus::stopped);
+}
+
+TEST_CASE("one read cannot cross a marked gap and post-gap data is preserved")
+{
+    RxSampleQueue queue(3);
+    queue.start();
+    queue.push(std::vector<std::int16_t>{1, 2, 3, 4}, 0, 1000000);
+    queue.markDiscontinuity();
+    queue.push(std::vector<std::int16_t>{91, 92, 93, 94}, 1000000, 1000000);
+    std::array<std::int16_t, 8> output{};
+    const auto prefix = queue.read(output.data(), 4, 0us);
+    REQUIRE(prefix.status == RxReadStatus::samples);
+    REQUIRE_EQ(prefix.samples, std::size_t{2});
+    REQUIRE_EQ(prefix.time_ns, std::int64_t{0});
+    REQUIRE_EQ(output[2], std::int16_t{3});
+    REQUIRE_EQ(output[4], std::int16_t{0});
+    const auto gap = queue.read(output.data(), 4, 0us);
+    REQUIRE(gap.status == RxReadStatus::overflow);
+    REQUIRE_EQ(gap.samples, std::size_t{0});
+    const auto suffix = queue.read(output.data(), 4, 0us);
+    REQUIRE(suffix.status == RxReadStatus::samples);
+    REQUIRE_EQ(suffix.samples, std::size_t{2});
+    REQUIRE_EQ(suffix.time_ns, std::int64_t{1000000});
+    REQUIRE_EQ(output[0], std::int16_t{91});
+}
+
+TEST_CASE("single-block overflow survives a zero-length read and is consumed once")
+{
+    RxSampleQueue queue(1);
+    queue.start();
+    queue.push(std::vector<std::int16_t>{1, 2, 3, 4}, 0, 1000000);
+    std::array<std::int16_t, 4> output{};
+    REQUIRE_EQ(queue.read(output.data(), 1, 0us).samples, std::size_t{1});
+    queue.push(std::vector<std::int16_t>{91, 92, 93, 94}, 1000000, 1000000);
+    REQUIRE(queue.read(nullptr, 0, 0us).status == RxReadStatus::samples);
+    REQUIRE(queue.read(output.data(), 2, 0us).status == RxReadStatus::overflow);
+    REQUIRE_EQ(queue.read(output.data(), 2, 0us).samples, std::size_t{2});
+    REQUIRE_EQ(output[0], std::int16_t{91});
+    REQUIRE(queue.read(output.data(), 2, 0us).status == RxReadStatus::timeout);
+}
+
+TEST_CASE("reactivation clears pending discontinuities and repeated marks coalesce")
+{
+    RxSampleQueue queue(2);
+    queue.start();
+    queue.markDiscontinuity();
+    queue.markDiscontinuity();
+    queue.push(std::vector<std::int16_t>{1, 2}, 0, 1000000);
+    std::int16_t output[2]{};
+    REQUIRE(queue.read(output, 1, 0us).status == RxReadStatus::overflow);
+    REQUIRE_EQ(queue.read(output, 1, 0us).samples, std::size_t{1});
+    queue.markDiscontinuity();
+    queue.start();
+    queue.push(std::vector<std::int16_t>{3, 4}, 0, 1000000);
+    REQUIRE_EQ(queue.read(output, 1, 0us).samples, std::size_t{1});
 }
 
 TEST_CASE("RX queue validates buffers rates timeouts and timestamp overflow")

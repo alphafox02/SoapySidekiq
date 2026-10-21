@@ -30,6 +30,7 @@ void RxSampleQueue::start()
     blocks_.clear();
     running_ = true;
     failed_ = false;
+    next_block_discontinuous_ = false;
     dropped_blocks_ = 0;
 }
 
@@ -61,9 +62,17 @@ void RxSampleQueue::reset()
         blocks_.clear();
         running_ = false;
         failed_ = false;
+        next_block_discontinuous_ = false;
         dropped_blocks_ = 0;
     }
     data_available_.notify_all();
+}
+
+void RxSampleQueue::markDiscontinuity()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (running_)
+        next_block_discontinuous_ = true;
 }
 
 RxPushStatus RxSampleQueue::push(const std::int16_t *samples, const std::size_t complex_samples,
@@ -130,10 +139,18 @@ RxPushStatus RxSampleQueue::pushWithPhase(std::vector<std::int16_t> samples,
         {
             return RxPushStatus::stopped;
         }
+        block.discontinuity_before = next_block_discontinuous_;
+        next_block_discontinuous_ = false;
         if (blocks_.size() == capacity_blocks_)
         {
             // Keep latency bounded without blocking the hardware receive worker.
             blocks_.pop_front();
+            // The gap belongs before the oldest retained data, including when
+            // a partially read block was displaced by a slow consumer.
+            if (blocks_.empty())
+                block.discontinuity_before = true;
+            else
+                blocks_.front().discontinuity_before = true;
             ++dropped_blocks_;
             dropped = true;
         }
@@ -203,12 +220,19 @@ RxReadResult RxSampleQueue::read(
     {
         return {failed_ ? RxReadStatus::error : RxReadStatus::stopped, 0, 0, false};
     }
+    if (blocks_.front().discontinuity_before)
+    {
+        blocks_.front().discontinuity_before = false;
+        return {RxReadStatus::overflow, 0, 0, false};
+    }
 
     // Capture metadata before consuming blocks; it belongs to the first sample.
     RxReadResult result{RxReadStatus::samples, 0, blockTime(blocks_.front()), true};
     while (result.samples < requested_samples && !blocks_.empty())
     {
         Block &block = blocks_.front();
+        if (block.discontinuity_before)
+            break;
         const std::size_t block_samples = block.samples.size() / 2;
         const std::size_t available = block_samples - block.offset;
         const std::size_t to_copy =

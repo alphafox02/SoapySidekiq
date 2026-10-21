@@ -225,7 +225,9 @@ TEST_CASE("RX session counts overruns and timestamp discontinuities")
 
     std::array<std::int16_t, 4> first{};
     std::array<std::int16_t, 4> second{};
+    REQUIRE(session.read(first.data(), 2, 250ms).status == RxReadStatus::overflow);
     REQUIRE_EQ(session.read(first.data(), 2, 250ms).samples, std::size_t{2});
+    REQUIRE(session.read(second.data(), 2, 250ms).status == RxReadStatus::overflow);
     REQUIRE_EQ(session.read(second.data(), 2, 250ms).samples, std::size_t{2});
     REQUIRE_EQ(session.hardwareOverruns(), std::size_t{1});
     REQUIRE_EQ(session.timestampDiscontinuities(), std::size_t{1});
@@ -245,6 +247,26 @@ TEST_CASE("RX session propagates fatal receive errors to blocked reads")
     REQUIRE(session.failed());
     REQUIRE_EQ(session.receiveError(), -77);
     REQUIRE_EQ(session.deactivate(), 0);
+}
+
+TEST_CASE("RF sample gaps are reported even when the client selects system timestamps")
+{
+    for (const bool rf : {true, false})
+    {
+        FakeRxBackend backend;
+        RxStreamSession session(backend);
+        REQUIRE_EQ(session.activate(configuration(rf)), 0);
+        backend.enqueue(samples(7, {1, 2, 3, 4}, 100, 10));
+        std::int16_t output[4]{};
+        REQUIRE_EQ(session.read(output, 2, 250ms).samples, std::size_t{2});
+        backend.enqueue(samples(7, {5, 6, 7, 8}, 200, 20));
+        REQUIRE(session.read(output, 2, 250ms).status == RxReadStatus::overflow);
+        const auto resumed = session.read(output, 2, 250ms);
+        REQUIRE_EQ(resumed.samples, std::size_t{2});
+        REQUIRE_EQ(resumed.time_ns, rf ? std::int64_t{10000} : std::int64_t{20000});
+        REQUIRE_EQ(output[0], std::int16_t{5});
+        REQUIRE_EQ(session.deactivate(), 0);
+    }
 }
 
 TEST_CASE("RX session rejects malformed hardware block sizes")

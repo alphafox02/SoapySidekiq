@@ -42,6 +42,7 @@ struct FakeSdk
     int stop_status{};
     unsigned starts{}, stops{};
     bool stop_on_pps{}, provide_packet{}, delivered{};
+    bool provide_overrun{}, overrun_delivered{};
     double actual_rate{20000000};
     std::uint64_t system_frequency{1000000}, rf_timestamp{1}, system_timestamp{1};
     unsigned rate_reads{}, frequency_reads{};
@@ -109,6 +110,11 @@ public:
     { return pps ? skiq_stop_rx_streaming_on_1pps(0, handle, 0) : skiq_stop_rx_streaming(0, handle); }
     soapy_sidekiq::RxReceiveResult receive() override
     {
+        if (sdk.provide_overrun && !sdk.overrun_delivered)
+        {
+            sdk.overrun_delivered = true;
+            return {soapy_sidekiq::RxReceiveStatus::overrun, 0, {}, 0, 0, 0};
+        }
         if (!sdk.provide_packet)
             throw std::runtime_error("injected receive failure");
         if (sdk.delivered)
@@ -209,6 +215,38 @@ TEST_CASE("closing a failed RX worker stops hardware and permits reactivation")
     device.closeStream(stream);
     REQUIRE_EQ(sdk.starts, 2u);
     REQUIRE_EQ(sdk.stops, 2u);
+}
+
+TEST_CASE("production readStream reports hardware loss before returning post-gap CS16 or CF32")
+{
+    for (const bool cs16 : {true, false})
+    {
+        SoapySidekiq device;
+        sdk.provide_packet = true;
+        sdk.provide_overrun = true;
+        device.rxUseShort = cs16;
+        auto *stream = device.setupRx();
+        REQUIRE_EQ(device.activateStream(stream, 0, 0, 0), 0);
+        std::int16_t shorts[4]{99, 99, 99, 99};
+        float floats[4]{99, 99, 99, 99};
+        void *buffers[]{cs16 ? static_cast<void *>(shorts) : static_cast<void *>(floats)};
+        int flags = 123;
+        long long time = 456;
+        REQUIRE_EQ(device.readStream(stream, buffers, 2, flags, time, 250000), SOAPY_SDR_OVERFLOW);
+        REQUIRE_EQ(flags, 0);
+        REQUIRE_EQ(time, 0LL);
+        REQUIRE_EQ(shorts[0], std::int16_t{99});
+        REQUIRE_EQ(floats[0], 99.0f);
+        REQUIRE_EQ(device.readStream(stream, buffers, 2, flags, time, 250000), 2);
+        REQUIRE_EQ(flags, SOAPY_SDR_HAS_TIME);
+        REQUIRE_EQ(time, 50LL);
+        if (cs16)
+            REQUIRE_EQ(shorts[0], std::int16_t{1});
+        else
+            REQUIRE_EQ(floats[0], 1.0f / 2048);
+        REQUIRE_EQ(device.deactivateStream(stream, 0, 0), 0);
+        device.closeStream(stream);
+    }
 }
 
 TEST_CASE("failed RX stop preserves ownership for a successful close retry")
